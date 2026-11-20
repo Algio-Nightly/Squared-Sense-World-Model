@@ -290,21 +290,3 @@ flowchart LR
 | **Baseline B Decoder** | `(B, 96, 1024)` | **1,150,144** | 2L Transformer + `Linear(192, 1024)` patch head |
 | **Baseline B (3D-MAE) Total**| — | **4,797,792** | Target ~5.126M (diff: $-6.4\%$, within budget) |
 
----
-
-## 7. Loss Formulations & Training Objectives
-
-### Stage 1A: Spatial JEPA Loss
-$$\mathcal{L}_{\text{Spatial}} = \frac{1}{B \cdot N_{\text{tgt}}} \sum_{b=1}^B \sum_{i \in \text{target\_idx}} \|\hat{s}_{b, i} - \tilde{s}_{b, i}\|_2^2$$
-where $\tilde{s}_{b, i} = \frac{s^{\text{target}}_{b, i} - \mu(s^{\text{target}}_{b, i})}{\sqrt{\sigma^2(s^{\text{target}}_{b, i}) + 10^{-6}}}$ is the per-token standardized EMA target representation, and $\hat{s}_{b, i}$ is the predictor output.  
-**Target Encoder Momentum Schedule**:
-$$\theta_{\text{target}} \leftarrow m \cdot \theta_{\text{target}} + (1 - m) \cdot \theta_{\text{context}}, \quad m \in [0.99, 0.999]$$
-
-### Stage 1B: Temporal Dynamics & Auxiliary IDM Loss
-$$\mathcal{L}_{\text{Temporal}} = \frac{1}{B \cdot T_{\text{valid}} \cdot K} \sum_{b=1}^B \sum_{t=1}^{T_{\text{valid}}} \sum_{k=1}^K \|\hat{z}_{b, t+k} - z_{b, t+k}\|_2^2 + \lambda_{\text{IDM}} \mathcal{L}_{\text{IDM}}$$
-$$\mathcal{L}_{\text{IDM}} = \frac{1}{B (T - 1)} \sum_{b=1}^B \sum_{t=1}^{T-1} \text{CrossEntropy}\left( \text{IDM}(z_{b, t}, z_{b, t+1}), a_{b, t} \right)$$
-where $z_t = \frac{1}{192} \sum_{i=1}^{192} \text{tokens}_{t, i} \in \mathbb{R}^{256}$ is the globally pooled ground-truth latent state at time $t$.
-
-### Baseline B: 3D-MAE Voxel Patch Reconstruction Loss
-$$\mathcal{L}_{\text{MAE}} = \frac{1}{B \cdot N_{\text{tgt}}} \sum_{b=1}^B \sum_{i \in \text{target\_idx}} \|\hat{p}_{b, i} - p_{b, i}\|_2^2$$
-where $p_{b, i} \in \mathbb{R}^{1024}$ is the flattened $4 \times 4 \times 4 \times 16$ ground-truth voxel sub-volume patch.
