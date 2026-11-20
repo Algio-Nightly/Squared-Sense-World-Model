@@ -88,8 +88,17 @@ Tracking implementation progress against `docs/CONTRACT.md`.
 - [ ] **T3.2**: Closed-loop rollout simulation
 
 ## Phase 4: Training & Diagnostics
-- [ ] **T4.1**: Training loops and composite loss functions (`train/`)
-- [ ] **T4.2**: Checkpoint management and diagnostics
+- [x] **T4.1**: Training losses and regularization utilities (`train/losses.py`, `tests/test_train_utils.py`)
+  - `smooth_l1_loss(pred, target, beta=1.0)`
+  - `vicreg_var_cov_loss(z, gamma=1.0, eps=1e-4)` variance and covariance penalties
+  - `spatial_jepa_loss(pred_targets, norm_ema_targets, context_tokens, alpha=0.1, beta=0.04)`
+  - `temporal_jepa_loss(pred_future, ema_future_targets, idm_logits, actions, gamma_discount=0.9, alpha=0.1, beta=0.04, omega=0.2)`
+  - `cosine_ema_momentum(step, total_steps, start=0.996, end=1.0)`
+- [x] **T4.2**: Checkpoint management and representation diagnostics (`train/checkpoint.py`, `train/diagnostics.py`, `tests/test_train_utils.py`)
+  - `compute_rankme(embeddings, eps=1e-7)`: uncentered continuous effective rank metric (>100 on isotropic random, <2 on rank-1 collapsed)
+  - `append_metrics_jsonl(path, record)`: structured epoch logging
+  - `save_checkpoint(path, module, metadata)` and `load_checkpoint(path, module)`: zero-dependency, cross-platform pure-dict serialization via pickle with exact bit-level roundtrip equality (`atol=0`)
+- [ ] **T4.3**: End-to-end training loops (`train_spatial_jepa.py`, `train_temporal_jepa.py`, `train_baselines.py`)
 
 ## Phase 5: Evaluation & Artifacts
 - [ ] **T5.1**: Probes and simulator evaluation (`eval/`)
