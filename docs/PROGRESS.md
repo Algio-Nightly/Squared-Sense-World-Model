@@ -107,7 +107,14 @@ Tracking implementation progress against `docs/CONTRACT.md`.
   - Representation diagnostics: uncentered RankMe computed on pooled validation embeddings every 5 epochs and final epoch
   - Metrics logging: records train/val loss, embedding std, EMA momentum, LR, and RankMe to `metrics.jsonl`
   - Verified via smoke test and optimizer exclusion unit tests (2 passed in `tests/test_train_spatial.py`)
-- [ ] **T4.3b**: Stage 1B Temporal JEPA training pipeline (`train_temporal_jepa.py`)
+- [x] **T4.3b**: Stage 1B Dual-LSTM Temporal JEPA training pipeline (`train/train_temporal_jepa.py`, `tests/test_train_temporal.py`)
+  - Two-phase anchored optimization pipeline with CLI (`--spatial_ckpt`, `--data_dir`, `--save_dir`, `--phase1_epochs`, `--phase2_epochs`, `--batch_size`, `--clip_len`, `--k_steps`, `--lr`, `--omega`, `--alpha`, `--beta`, `--anchor_weight`, `--seed`, `--smoke_test`)
+  - Phase 1 (Frozen Spatial Backbone): Trains `DualLSTMTemporalIntegrator` on stop-gradient representations with K=4 rollout discounted L1 loss and auxiliary IDM cross-entropy; leaves spatial parameters completely untouched
+  - Phase 2 (Unfreeze Top 2 Blocks + Spatial Anchor): Dual optimizer targeting `blocks[-2:]` and final `norm` of context encoder at 0.1x LR (3e-5) alongside `DualLSTMTemporalIntegrator` at 3e-4, anchored by Stage 1A masked prediction loss and spatial EMA updates (0.999)
+  - Selective parameter isolation: leaves `cnn` and `blocks[:2]` strictly untouched during Phase 2
+  - Evaluates continuous effective rank (RankMe) on fused validation context states $c_t$
+  - Saves `temporal_best.pkl`, `spatial_finetuned_best.pkl`, and structured records in `metrics.jsonl`
+  - Verified via smoke test, Phase 1 weight freeze assertion, and Phase 2 selective update assertion (3 passed in `tests/test_train_temporal.py`)
 - [ ] **T4.3c**: Baselines training pipeline (`train_baselines.py`)
 
 ## Phase 5: Evaluation & Artifacts
