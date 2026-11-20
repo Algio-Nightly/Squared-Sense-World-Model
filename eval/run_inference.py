@@ -1,0 +1,340 @@
+"""
+Real-Time Single-Inference Playback Runner for Squared Sense World Model.
+
+Loads a trained JAX/Flax NNX policy and perception backbone, executes pathfinding
+rollouts on real Minecraft terrain (or debug bridge courses), and streams live
+observations with rich TELM v1 inference telemetry directly into the shared memory
+IPC buffer (squared_sense_mc.bin) for interactive 3D WebGL inspection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import flax.nnx as nnx
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from eval.sim_env import VoxelNavEnv, make_debug_bridge_course
+from eval.train_ppo_nav import ActorCriticHead, extract_step_feature
+from env.minecraft_env import MinecraftNavEnv
+from env.ipc_emitter import MinecraftIpcEmitter
+from env.ipc_telemetry import InferenceTelemetry
+from models.baselines import Generative3DMAE, SingleLODJEPA
+from models.temporal_lstm import DualLSTMTemporalIntegrator
+from models.transformer import SpatialJEPA
+from train.checkpoint import load_checkpoint
+
+ACTION_NAMES = [
+    "FORWARD",
+    "FORWARD_LEFT",
+    "FORWARD_RIGHT",
+    "STRAFE_LEFT",
+    "STRAFE_RIGHT",
+    "BACKWARD",
+    "TURN_LEFT",
+    "TURN_RIGHT",
+    "STEP_UP",
+    "PITCH_UP",
+    "PITCH_DOWN",
+    "IDLE",
+]
+
+
+def check_keyboard_input() -> Optional[str]:
+    """Non-blocking keyboard check on Windows."""
+    try:
+        import msvcrt
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b' ', b'p', b'P'):
+                return "SPACE"
+            elif ch in (b'n', b'N'):
+                return "NEXT"
+            elif ch in (b'r', b'R'):
+                return "RESET"
+            elif ch in (b'q', b'Q', b'\x1b'):
+                return "QUIT"
+    except ImportError:
+        pass
+    return None
+
+
+def run_inference_episode(
+    env: Any,
+    backbone: Any,
+    policy: ActorCriticHead,
+    emitter: MinecraftIpcEmitter,
+    model_type: str = "m2_static",
+    temporal_model: Optional[DualLSTMTemporalIntegrator] = None,
+    checkpoint_meta: Optional[Dict[str, Any]] = None,
+    fps: float = 10.0,
+    greedy: bool = True,
+    step_pause: bool = False,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """Executes a single inference rollout while streaming telemetry to MMF."""
+    rng = np.random.default_rng(seed)
+    key = jax.random.PRNGKey(seed)
+
+    obs = env.reset()
+    temporal_hidden = None
+
+    player_pos = getattr(env, "player_pos", getattr(env, "pos", np.array([0, 64, 0])))
+    target_pos = getattr(env, "target_pos", getattr(env, "active_waypoint", (0, 64, 10)))
+    optimal_path = getattr(env, "optimal_path", [])
+    l_ref = getattr(env, "shortest_path_len", 10.0)
+
+    print("\n=======================================================")
+    print(f"Episode Started! Spawn: {tuple(player_pos)} -> Target: {tuple(target_pos)}")
+    print(f"Reference Path Length: {l_ref:.1f} blocks | FPS: {fps}")
+    print("Streaming live frames to 3D WebGL visualizer...")
+    print("Controls: [SPACE]=Pause/Resume | [N]=Step | [R]=Reset | [Q]=Quit")
+    print("=======================================================\n")
+
+    breadcrumbs: List[Tuple[int, int, int]] = [tuple(player_pos)]
+    bfs_tuples: List[Tuple[int, int, int]] = [tuple(p) for p in optimal_path]
+
+    step_delay = 1.0 / fps if fps > 0 else 0.0
+    ep_return = 0.0
+    step_count = 0
+    paused = step_pause
+    done = False
+    last_info: Dict[str, Any] = {}
+
+    while not done:
+        # Check non-blocking keyboard controls
+        key_cmd = check_keyboard_input()
+        if key_cmd == "SPACE":
+            paused = not paused
+            print(f"  >>> [{ 'PAUSED' if paused else 'RESUMED' }]")
+        elif key_cmd == "QUIT":
+            print("  >>> User requested quit.")
+            break
+        elif key_cmd == "RESET":
+            print("  >>> Manual episode reset.")
+            break
+
+        if paused:
+            if key_cmd == "NEXT":
+                pass  # Step single frame
+            else:
+                time.sleep(0.05)
+                continue
+
+        step_t0 = time.perf_counter()
+
+        # 1. Feature Extraction from frozen backbone
+        feat, temporal_hidden = extract_step_feature(
+            backbone=backbone,
+            model_type=model_type,
+            shells=obs["shells"],
+            state=obs["state"],
+            temporal_model=temporal_model,
+            temporal_hidden=temporal_hidden,
+        )
+
+        # 2. Policy forward pass
+        goal_v = obs["goal_vec"]
+        logits, values = policy(feat, goal_v)
+        action_probs = np.array(jax.nn.softmax(logits[0]))
+        v_est = float(values[0])
+
+        # Action masking if available
+        if "action_mask" in obs:
+            mask = obs["action_mask"]
+            masked_probs = action_probs * mask
+            s = masked_probs.sum()
+            if s > 0:
+                action_probs = masked_probs / s
+
+        if greedy:
+            action = int(np.argmax(action_probs))
+        else:
+            key, subkey = jax.random.split(key)
+            action = int(jax.random.categorical(subkey, jnp.asarray(np.log(action_probs + 1e-8))))
+
+        # 3. Environment Step
+        next_obs, reward, done, last_info = env.step(action)
+        ep_return += reward
+        step_count += 1
+
+        curr_player = getattr(env, "player_pos", getattr(env, "pos", player_pos))
+        breadcrumbs.append(tuple(curr_player))
+        if len(breadcrumbs) > 64:
+            breadcrumbs.pop(0)
+
+        # 4. Pack and Emit Inference Telemetry
+        target_tuple = tuple(getattr(env, "target_pos", getattr(env, "active_waypoint", target_pos)))
+        d_curr = float(np.linalg.norm(np.array(curr_player) - np.array(target_tuple)))
+
+        # Relative world delta for 3D visualizer beacon
+        world_dx = float(target_tuple[0] - curr_player[0])
+        world_dy = float(target_tuple[1] - curr_player[1])
+        world_dz = float(target_tuple[2] - curr_player[2])
+
+        # Relative path points for 3D visualizer
+        bc_rel = [(p[0] - curr_player[0], p[1] - curr_player[1], p[2] - curr_player[2]) for p in breadcrumbs]
+        bfs_rel = [(p[0] - curr_player[0], p[1] - curr_player[1], p[2] - curr_player[2]) for p in bfs_tuples[:64]]
+
+        telem_bytes = InferenceTelemetry.pack(
+            target_pos=(target_tuple[0], target_tuple[1], target_tuple[2]),
+            world_delta=(world_dx, world_dy, world_dz),
+            target_dist=d_curr,
+            step_reward=float(reward),
+            episode_return=float(ep_return),
+            critic_value=v_est,
+            action_probabilities=list(action_probs),
+            breadcrumbs=bc_rel,
+            optimal_path=bfs_rel,
+            checkpoint_loss=float(checkpoint_meta.get("loss", 0.0) if checkpoint_meta else 0.0),
+        )
+
+        # Emit raw observation to MMF slot
+        cardinal_str = getattr(env, "cardinal", "SOUTH")
+        foot_idx = getattr(env, "foot_index", 6)
+        yaw_val = getattr(env, "yaw", 0.0)
+        pitch_val = getattr(env, "camera_pitch", getattr(env, "pitch", 0.0))
+
+        if hasattr(env, "extractor"):
+            raw_view = env.extractor.extract_observation(tuple(curr_player), cardinal_str, foot_index=foot_idx)
+            emitter.emit_observation(
+                raw_view,
+                game_tick=step_count,
+                telemetry_bytes=telem_bytes,
+            )
+
+        act_name = ACTION_NAMES[action] if action < len(ACTION_NAMES) else f"ACT_{action}"
+        print(
+            f"  [Step {step_count:02d}] Pos: {tuple(curr_player)} | "
+            f"Dist: {d_curr:.1f}m | Action: {act_name:<12} (p={action_probs[action]:.2f}) | "
+            f"Critic V(s): {v_est:+.2f} | Rew: {reward:+.2f}"
+        )
+
+        obs = next_obs
+
+        # Rate limiter
+        elapsed = time.perf_counter() - step_t0
+        if step_delay > elapsed:
+            time.sleep(step_delay - elapsed)
+
+    success = bool(last_info.get("success", False))
+    print(f"\nEpisode Finished! Success: {success} | Total Return: {ep_return:.2f} | Steps: {step_count}")
+    return {"success": success, "return": ep_return, "steps": step_count}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Squared Sense World Model — Real-Time Inference Runner")
+    parser.add_argument("--region_dir", type=str, default="data/baked_regions", help="Path to baked Minecraft region memmaps")
+    parser.add_argument("--model_type", type=str, default="m2_static", choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"])
+    parser.add_argument("--ckpt", type=str, default=None, help="Path to trained backbone checkpoint (.pkl)")
+    parser.add_argument("--policy_ckpt", type=str, default="checkpoints/ppo_nav/policy_best.pkl", help="Path to trained ActorCriticHead (.pkl)")
+    parser.add_argument("--temporal_ckpt", type=str, default=None, help="Path to trained DualLSTM checkpoint (.pkl)")
+    parser.add_argument("--episodes", type=int, default=5, help="Number of inference episodes")
+    parser.add_argument("--fps", type=float, default=10.0, help="Stepping speed in FPS (0 for unthrottled)")
+    parser.add_argument("--pause", action="store_true", help="Start episode in paused state")
+    parser.add_argument("--greedy", action="store_true", default=True, help="Take deterministic argmax action")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "gpu", "cpu"], help="Target acceleration device (auto, gpu, cpu)")
+
+    args = parser.parse_args()
+
+    # Configure GPU memory and platform
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if args.device != "auto":
+        jax.config.update("jax_platform_name", args.device)
+
+    backend = jax.default_backend()
+    devices = jax.devices()
+    print(f"\n=======================================================")
+    print(f"Squared Sense World Model — Real-Time Inference Runner")
+    print(f"JAX Backend: {backend.upper()} | Devices: {devices}")
+    print(f"=======================================================\n")
+
+    rng = nnx.Rngs(args.seed)
+
+    # 1. Instantiate Backbone
+    temporal_model: Optional[DualLSTMTemporalIntegrator] = None
+    if args.model_type == "m2_static":
+        backbone = SpatialJEPA(num_shells=3, rngs=rng)
+        feat_dim = 256
+    elif args.model_type == "m1_full":
+        backbone = SpatialJEPA(num_shells=3, rngs=rng)
+        temporal_model = DualLSTMTemporalIntegrator(rngs=rng)
+        feat_dim = 448
+    elif args.model_type == "b1_lod0":
+        backbone = SingleLODJEPA(lod_index=0, rngs=rng)
+        feat_dim = 256
+    elif args.model_type == "b2_lod2":
+        backbone = SingleLODJEPA(lod_index=2, rngs=rng)
+        feat_dim = 256
+    elif args.model_type == "b3_mae":
+        backbone = Generative3DMAE(rngs=rng)
+        feat_dim = 256
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
+
+    if args.ckpt and os.path.exists(args.ckpt):
+        print(f"Loading backbone from {args.ckpt}...")
+        load_checkpoint(args.ckpt, backbone)
+
+    if temporal_model and args.temporal_ckpt and os.path.exists(args.temporal_ckpt):
+        print(f"Loading temporal model from {args.temporal_ckpt}...")
+        load_checkpoint(args.temporal_ckpt, temporal_model)
+
+    # 2. Instantiate Policy
+    policy = ActorCriticHead(feat_dim=feat_dim, num_actions=12, rngs=rng)
+    checkpoint_meta = {}
+    if args.policy_ckpt and os.path.exists(args.policy_ckpt):
+        print(f"Loading policy from {args.policy_ckpt}...")
+        checkpoint_meta = load_checkpoint(args.policy_ckpt, policy)
+
+    # 3. Instantiate Environment
+    if os.path.exists(args.region_dir):
+        print(f"Loading MinecraftNavEnv from {args.region_dir}...")
+        env = MinecraftNavEnv(region_dir=args.region_dir)
+    else:
+        print(f"Region dir '{args.region_dir}' not found. Using debug bridge course...")
+        vol, start, wps = make_debug_bridge_course(seed=args.seed)
+        env = VoxelNavEnv(volume=vol, start=start, waypoints=wps)
+
+    # 4. IPC Emitter
+    emitter = MinecraftIpcEmitter()
+
+    # 5. Run Episodes
+    success_count = 0
+    for ep in range(args.episodes):
+        res = run_inference_episode(
+            env=env,
+            backbone=backbone,
+            policy=policy,
+            emitter=emitter,
+            model_type=args.model_type,
+            temporal_model=temporal_model,
+            checkpoint_meta=checkpoint_meta,
+            fps=args.fps,
+            greedy=args.greedy,
+            step_pause=args.pause,
+            seed=args.seed + ep,
+        )
+        if res["success"]:
+            success_count += 1
+
+    print(f"\nInference complete! Success Rate: {success_count / args.episodes * 100:.1f}%")
+    emitter.close()
+
+
+if __name__ == "__main__":
+    main()
