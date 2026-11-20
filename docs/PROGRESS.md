@@ -124,6 +124,39 @@ Tracking implementation progress against `docs/CONTRACT.md`.
   - Verified across all three baseline variants in smoke test mode (3 passed in `tests/test_train_baselines.py`)
 
 ## Phase 5: Evaluation & Artifacts
-- [ ] **T5.1**: Probes and simulator evaluation (`eval/`)
-- [ ] **T5.2**: Publication vector figures (`paper_figs/`)
+- [x] **T5.1**: Probes and simulator evaluation (`eval/`, `tests/test_probes.py`, `tests/test_sim_env.py`)
+  - **Ticket E1 — Frozen Representation & Dynamics Probe Suite (`eval/probe_suite.py`, `tests/test_probes.py`)**:
+    - `extract_features(model, model_type, shells, state=None, action=None, temporal_model=None, batch_size=32) -> np.ndarray`: Frozen JAX inference (`@nnx.jit`, no gradients) returning `(N, 256)` float32 features for static models (`m2_static`, `b1_lod0`, `b2_lod2`, `b3_mae`) and `(N, 448)` concatenating $z_t$ and $c_t$ for `m1_full`.
+    - Four lightweight scikit-learn linear/logistic probes evaluated across 3 seeds `[0, 1, 2]` reporting mean and std:
+      - `probe_distant_goal`: Ridge regression ($R^2$, mean cosine similarity) to distant waypoint coordinates.
+      - `probe_local_hazard`: Logistic regression with balanced class weights (macro $F_1$, AUROC) detecting lava hazard; gracefully handles single-class edge cases in small smoke tests.
+      - `probe_kinematic_and_occlusion`: Ridge regression for forward velocity ($R^2$) and logistic regression for binary occlusion ($F_1$).
+      - `eval_multistep_rollout`: Closed-loop dynamics rollout over horizons $h \in \{1, 2, 4, 8\}$ reporting per-horizon cosine similarity, $L_1$ error, and uncentered RankMe continuous rank metric.
+    - CLI supporting `--model_type`, `--ckpt`, `--temporal_ckpt`, `--data_dir`, `--out_json`, and `--smoke_test` with structured JSON output.
+    - Verified via unit and smoke tests across all models in `tests/test_probes.py` (6 passed).
+  - **Ticket E2 — Deterministic 3D Voxel Navigation Simulator (`eval/sim_env.py`, `tests/test_sim_env.py`)**:
+    - `CardinalSnapper`: Yaw angle discretization with $\pm 15^\circ$ deadband hysteresis preventing flip-flop at boundaries.
+    - Built-in `extract_shells`: Standalone multi-LOD voxel crop with channel-last layout `(3, 16, 16, 16, 16)` float32 in $[0, 1]$, forward offset $+12/-4$, pitch vertical shift, salience max-pooling on `MAX_POOL_CHANNELS`, and average pooling on `AVG_POOL_CHANNELS`.
+    - `VoxelNavEnv`: Deterministic navigation simulator operating on $(16, 128, 64, 128)$ courses with waypoint beacon injection into channel 8 (255) for LOD-2 visibility. Pre-padded volume slicing and pairwise SIMD salience pooling executing 200 steps in $\sim 0.15$s on CPU ($< 1.0$s limit).
+    - 12 discrete actions, exact voxel collision with 1-block step-up, drop physics ($\Delta y \le -3$ fall penalty), and hazard check (channel 2 $\ge 128$).
+    - Exact potential-based reward function: $+10.0$ waypoint reach, $+0.25 \times (d_{\text{prev}} - d_{\text{curr}})$, $-5.0$ lava hazard, $-3.0$ fall $\ge 3$, $-0.1$ wall bump, $-0.02$ step penalty.
+    - `make_debug_bridge_course`: Built-in test arena with 1-block wide bridge over lava trench and distant waypoint.
+    - Verified in `tests/test_sim_env.py` covering shapes, ranges, bridge traversal, lava hazard termination, wall bumps, and speed (6 passed).
+  - **Ticket E3 — Frozen-Backbone PPO Trainer & Zero-Shot Course Evaluator (`eval/train_ppo_nav.py`, `eval/eval_navigation.py`, `tests/test_eval_nav.py`)**:
+    - `ActorCriticHead(feat_dim, num_actions=12)`: MLP head mapping $\text{concat}([z_t, \hat{g}_t])$ (`feat_dim + 3`) $\to \text{Linear}(128) \to \text{GELU} \to \text{Linear}(128) \to \text{GELU} \to$ Actor $\text{Linear}(12) +$ Critic $\text{Linear}(1)$ (51,469 parameters for `feat_dim=256`, target $\sim 50\text{K}$).
+    - `train_bc_warmstart`: Behavioral Cloning warm-start minimizing cross-entropy on frozen feature representations for rapid policy bootstrapping.
+    - `train_ppo`: Clipped PPO ($\epsilon=0.2, \gamma=0.99, \lambda=0.95, c_{\text{ent}}=0.01, c_{\text{vf}}=0.5$, AdamW with lr=3e-4, grad clip 0.5) where the perception backbone is 100% frozen (zero gradients, `stop_gradient`) and ONLY `ActorCriticHead` parameters are updated.
+    - Exact parameter preservation: Verified backbone parameters are bit-identical before and after PPO updates ($\Delta = 0.0$).
+    - `evaluate_navigation`: Zero-shot course evaluator computing Success Rate (SR %), SPL ($\frac{1}{N}\sum S_i \frac{l_i}{\max(p_i, l_i)}$), Waypoint Completion %, Hazard Collision Rate %, Empirical MFLOPs/step, and Latency (ms/step).
+    - Verified `EventDrivenShellGate` acceleration: Evaluated gating ON vs OFF, confirming gating strictly reduces empirical compute from 1743.6 MFLOPs/step while preserving valid outputs.
+    - Verified in `tests/test_eval_nav.py` (4 passed).
+- [x] **T5.2**: Publication vector figures (`paper_figs/make_figures.py`, `tests/test_figures.py`)
+  - **Ticket F1 — Springer Nature LNEE Vector Figures Generator (`paper_figs/make_figures.py`, `tests/test_figures.py`)**:
+    - Compliant with Springer Nature LNEE publication standards: vector PDF (`.pdf`), high-resolution 600 DPI PNG (`.png`), TrueType font embedding (`pdf.fonttype=42`), grayscale-safe colorblind palette, distinct markers/linestyles, and zero raw Minecraft screenshots.
+    - Implemented 4 modular plotting functions with `--demo` synthetic mode and CLI:
+      1. `plot_training_and_rankme`: 2-panel figure showing Stage 1A/1B validation loss convergence and continuous effective rank trajectories ($\mathcal{R}_{\mathrm{exp}} \gg 100$ vs collapsed baseline $r < 2$).
+      2. `plot_3d_patch_similarity`: DINO-style 3D voxel patch cosine self-similarity maps rendered across LOD-0 ($1\times$), LOD-1 ($2\times$), and LOD-2 ($4\times$) shells.
+      3. `plot_gating_efficiency`: Grouped bar chart with grayscale-safe hatched bars comparing dense (1743.6 MFLOPs) vs. Event-Driven Shell Gating across movement regimes (Stationary, Straight Walking, Bridge Crossing, Obstacle Dodging) with speedup annotations (up to 100% compute savings).
+      4. `plot_navigation_trajectories`: Clean 2D top-down and 3D isometric Matplotlib visualizer rendered directly from NumPy voxel arrays, comparing A* oracle path vs. M1 (Squared Sense), B1 (LOD-0 Myopic), and B2 (LOD-2 Coarse).
+    - Verified in `tests/test_figures.py` asserting all 4 vector PDF files (>5 KB) and PNG previews are generated cleanly (2 passed).
 
