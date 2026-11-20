@@ -14,6 +14,13 @@ Strictly follows docs/EVAL_CONTRACT.md and docs/CONTRACT.md.
 from __future__ import annotations
 
 import math
+import os
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -556,3 +563,18 @@ class VoxelNavEnv:
 
         obs = self._get_obs()
         return obs, float(reward), bool(done), info
+
+
+def make_env(
+    region_dir: Optional[str] = None,
+    seed: int = 42,
+    **kwargs: Any
+) -> Any:
+    """Factory creating MinecraftNavEnv if region_dir exists, else debug bridge VoxelNavEnv."""
+    import os
+    if region_dir is not None and os.path.exists(region_dir):
+        from env.minecraft_env import MinecraftNavEnv
+        return MinecraftNavEnv(region_dir=region_dir, **kwargs)
+    volume, start, waypoints = make_debug_bridge_course(seed=seed)
+    return VoxelNavEnv(volume=volume, start=start, waypoints=waypoints, **kwargs)
+
