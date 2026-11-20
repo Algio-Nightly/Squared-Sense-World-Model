@@ -98,7 +98,17 @@ Tracking implementation progress against `docs/CONTRACT.md`.
   - `compute_rankme(embeddings, eps=1e-7)`: uncentered continuous effective rank metric (>100 on isotropic random, <2 on rank-1 collapsed)
   - `append_metrics_jsonl(path, record)`: structured epoch logging
   - `save_checkpoint(path, module, metadata)` and `load_checkpoint(path, module)`: zero-dependency, cross-platform pure-dict serialization via pickle with exact bit-level roundtrip equality (`atol=0`)
-- [ ] **T4.3**: End-to-end training loops (`train_spatial_jepa.py`, `train_temporal_jepa.py`, `train_baselines.py`)
+- [x] **T4.3a**: Stage 1A Spatial JEPA training pipeline (`train/train_spatial_jepa.py`, `tests/test_train_spatial.py`)
+  - Full CLI with `argparse`: `--data_dir`, `--save_dir`, `--epochs`, `--batch_size`, `--lr`, `--weight_decay`, `--warmup_epochs`, `--alpha`, `--beta`, `--seed`, `--smoke_test`
+  - Optimizer: `optax.adamw` with warmup cosine decay schedule and gradient norm clipping
+  - Optimizer isolation: strictly updates ONLY `context_encoder` and `predictor` parameters, with `target_encoder` updated solely via cosine scheduled EMA (`0.996 -> 1.0`)
+  - JIT-compiled optimization step (`@nnx.jit train_step`) and evaluation step (`@nnx.jit val_step`)
+  - Checkpoint management: saves `last.pkl` and `best.pkl` (lowest val loss) via zero-dependency pure-dict serialization
+  - Representation diagnostics: uncentered RankMe computed on pooled validation embeddings every 5 epochs and final epoch
+  - Metrics logging: records train/val loss, embedding std, EMA momentum, LR, and RankMe to `metrics.jsonl`
+  - Verified via smoke test and optimizer exclusion unit tests (2 passed in `tests/test_train_spatial.py`)
+- [ ] **T4.3b**: Stage 1B Temporal JEPA training pipeline (`train_temporal_jepa.py`)
+- [ ] **T4.3c**: Baselines training pipeline (`train_baselines.py`)
 
 ## Phase 5: Evaluation & Artifacts
 - [ ] **T5.1**: Probes and simulator evaluation (`eval/`)
