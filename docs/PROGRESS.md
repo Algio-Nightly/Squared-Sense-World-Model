@@ -31,6 +31,7 @@ Tracking implementation progress against `docs/CONTRACT.md`.
 - [ ] **T1.5**: Minecraft Java mod export integration (`mod_export/`)
   - `/sqsense export <name>` integration and volume exporter
 
+
 ## Phase 2: Neural World Model Architecture
 - [x] **T2.1**: Multi-LOD 3D CNN encoder (`models/cnn3d.py`, `tests/test_cnn3d.py`)
   - Siamese 3D ConvNeXt + SE attention + CoordConv3D
@@ -115,7 +116,12 @@ Tracking implementation progress against `docs/CONTRACT.md`.
   - Evaluates continuous effective rank (RankMe) on fused validation context states $c_t$
   - Saves `temporal_best.pkl`, `spatial_finetuned_best.pkl`, and structured records in `metrics.jsonl`
   - Verified via smoke test, Phase 1 weight freeze assertion, and Phase 2 selective update assertion (3 passed in `tests/test_train_temporal.py`)
-- [ ] **T4.3c**: Baselines training pipeline (`train_baselines.py`)
+- [x] **T4.3c**: Parameter-Matched Baselines training pipeline (`train/train_baselines.py`, `tests/test_train_baselines.py`)
+  - Unified CLI with `--model` choices `["b1_lod0", "b2_lod2", "b3_mae"]`, `--data_dir`, `--save_dir`, `--epochs`, `--batch_size`, `--lr`, `--weight_decay`, `--warmup_epochs`, `--seed`, `--smoke_test`
+  - SingleLODJEPA (`b1_lod0` & `b2_lod2`): 64-token single-shell training via `sample_3d_jepa_masks(num_shells=1)`, `spatial_jepa_loss` (Smooth-L1 + VICReg var/cov), optimizer updating only context encoder & predictor, cosine EMA update (`0.996 -> 1.0`), and uncentered RankMe diagnostics on validation embeddings
+  - Generative3DMAE (`b3_mae`): 192-token 3D masked autoencoding via `sample_3d_jepa_masks(num_shells=3)`, patch MSE loss minimization over masked $4\times 4\times 4\times 16$ voxel patches, end-to-end AdamW optimization, and uncentered RankMe diagnostics on encoder representations
+  - Saves `best.pkl`, `last.pkl`, and structured epoch logging in `metrics.jsonl`
+  - Verified across all three baseline variants in smoke test mode (3 passed in `tests/test_train_baselines.py`)
 
 ## Phase 5: Evaluation & Artifacts
 - [ ] **T5.1**: Probes and simulator evaluation (`eval/`)
