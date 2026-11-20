@@ -32,8 +32,54 @@ Tracking implementation progress against `docs/CONTRACT.md`.
   - `/sqsense export <name>` integration and volume exporter
 
 ## Phase 2: Neural World Model Architecture
-- [ ] **T2.1**: Multi-LOD 3D CNN encoder (`models/`)
-  - Concentric shell fusion
+- [x] **T2.1**: Multi-LOD 3D CNN encoder (`models/cnn3d.py`, `tests/test_cnn3d.py`)
+  - Siamese 3D ConvNeXt + SE attention + CoordConv3D
+  - Layout: Channel-last `(..., X, Y, Z, C)`
+  - Exact parameter count: **470,944** trainable parameters (target budget ~470,560, diff +384 / +0.08%)
+  - Concentric shell fusion: `(B, 3, 16, 16, 16, 16) -> (B, 192, 256)`
+- [x] **M2**: Transformer Encoder, EMA Target, JEPA Predictor & 3D Masking (`models/transformer.py`, `tests/test_transformer.py`)
+  - `PreLNTransformerBlock` (Pre-LN Multi-Head Attention + MLP with residuals)
+  - `MultiLODBackbone` (Siamese 3D CNN + Pos+Scale Embeddings + 4L Transformer Encoder)
+  - `JEPAPredictor` (Input Proj + Mask Token + Pos+Scale Embeddings + 2L Transformer + Output Proj)
+  - `sample_3d_jepa_masks`: Pure JAX JIT-safe 3D masking over 2x2x2 blocks with cross-scale complementary logic
+  - `SpatialJEPA` with in-place EMA target update (`update_ema`) and stop-gradient EMA targets
+  - Exact parameter counts:
+    - Core Backbone (`context_encoder`): **3,647,648** params (target ~3,647,264, diff +384 / +0.01%)
+    - Predictor: **1,001,920** params (target ~1,001,920, exact 0% diff)
+    - Stage 1A Spatial Total (`context_encoder + predictor`): **4,649,568** params (target ~4,649,184, diff +384 / +0.008%)
+- [x] **M3**: Event-Driven Multi-LOD Shell Gating (`models/gating.py`, `tests/test_gating.py`)
+  - Host-side stateful cache: `prev_shells`, `prev_cnn_tokens`, `prev_z`
+  - Zero learnable parameters (0 params)
+  - Selective CNN evaluation when $\Delta_l > \tau_{\text{gate}}$ and conditional Transformer skip
+  - Verified lossless equivalence at $\tau_{\text{gate}} = 0.0$ against dense evaluation ($\text{max diff} < 3 \times 10^{-6}$)
+  - 5-step test counts: LOD-0 = 3/5, LOD-1 = 2/5, LOD-2 = 1/5, Transformer = 3/5
+  - Empirical compute: **969.24 MFLOPs/step** vs 1743.6 MFLOPs/step dense baseline (44.4% compute reduction)
+- [x] **M4**: Dual-LSTM Temporal Integrator & Ego-Motion 3D Shift (`models/temporal_lstm.py`, `tests/test_temporal_lstm.py`)
+  - `ego_motion_shift_3d`: differentiable, JIT-compatible 3D coordinate shift with trilinear interpolation (`map_coordinates`) vmapped across batch and channels
+  - `LSTMCellNNX`: standard LSTM cell in Flax NNX
+  - `QueryCrossAttentionBlock`: Pre-LN Cross-Attention fusing proprioceptive query with 24 coarse 3D spatial memory slots
+  - `DualLSTMTemporalIntegrator`:
+    - Spatial 2x2x2 block average pooling: `(B, 192, 256) -> (B, 24, 256)`
+    - Ego-motion shifting per LOD shell scale `(1.0, 2.0, 4.0)` before spatial LSTM step
+    - Proprioceptive state LSTM (`12 -> 64`) with projection producing query token (`(B, 1, 192)`)
+    - Action-conditioned future predictor (`action_embed(12, 64)` + MLP `256 -> 192 -> 256`) predicting pooled `z_hat_next`
+    - Auxiliary Inverse Dynamics Model (IDM) head (`[z_t, z_{t+1}] -> 64 -> 12`)
+    - Autoregressive multi-step `rollout(k_steps=4)`
+  - Exact parameter count: **807,564** parameters (~0.808M; target ~724,864, including auxiliary IDM head)
+  - Verified finite non-zero gradients via `nnx.value_and_grad` and `@nnx.jit` execution
+- [x] **M5**: Baselines Architecture (`models/baselines.py`, `tests/test_baselines.py`)
+  - **Baseline A (Single-LOD JEPA)**:
+    - Slices single LOD shell (`x[:, lod_index:lod_index+1]`, 64 tokens)
+    - Wraps `SpatialJEPA(num_shells=1)` with EMA target updating
+    - Trainable parameter count: **4,648,672** params (target ~4,648,672, exact 0.000% difference)
+    - Verified forward pass and finite non-zero gradients via `nnx.value_and_grad` inside `@nnx.jit` for both LOD-0 and LOD-2
+    - Verified zero gradients on target encoder
+  - **Baseline B (Generative 3D-MAE)**:
+    - Reuses `MultiLODBackbone(num_shells=3)` context encoder (**3,647,648** params)
+    - Lightweight 3D voxel decoder (**1,150,144** params): `Linear(256, 192)` + `mask_token` + pos/scale embeds + `2 × PreLNTransformerBlock(192, 6, mlp_ratio=4)` + `LayerNorm(192)` + `Linear(192, 1024)` reconstructing 4x4x4x16 voxel patches
+    - Total parameters: **4,797,792** params (target ~5.126M params, within ~6.4%)
+    - `patchify`: Verified coordinate matching against direct sub-volume slices
+    - Computes `mse_loss` strictly over masked target patches with scalar loss and finite non-zero gradients inside `@nnx.jit`
 - [ ] **T2.2**: State & action conditioning modules
 - [ ] **T2.3**: Dynamics transition model
 
