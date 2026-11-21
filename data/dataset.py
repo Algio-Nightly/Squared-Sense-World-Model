@@ -41,9 +41,55 @@ def load_episode_splits(
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Episode directory '{data_dir}' does not exist.")
 
-    files = sorted(
-        [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npz")]
-    )
+    # Check if data_dir is a baked region directory
+    has_mmap = any(f.endswith(".mmap") for f in os.listdir(data_dir))
+    has_manifest = os.path.exists(os.path.join(data_dir, "world_manifest.json"))
+    is_region_dir = has_mmap or has_manifest
+
+    def _is_ep_file(fname: str) -> bool:
+        return (
+            fname.endswith(".npz")
+            and not fname.endswith(".heightmap.npz")
+            and not fname.endswith(".spawns.npz")
+        )
+
+    episodes_dir = os.path.join(data_dir, "episodes") if is_region_dir else data_dir
+    files = []
+    if os.path.exists(episodes_dir):
+        files = sorted(
+            [
+                os.path.join(episodes_dir, f)
+                for f in os.listdir(episodes_dir)
+                if _is_ep_file(f)
+            ]
+        )
+
+    # Check for subfolder 'episodes' if none found at root
+    if not files and not is_region_dir:
+        episodes_sub = os.path.join(data_dir, "episodes")
+        if os.path.exists(episodes_sub):
+            files = sorted(
+                [
+                    os.path.join(episodes_sub, f)
+                    for f in os.listdir(episodes_sub)
+                    if _is_ep_file(f)
+                ]
+            )
+
+    # If still no episodes, check if data_dir contains baked region memmaps
+    if not files and is_region_dir:
+        from env.record_episodes import record_episodes
+        out_episodes = os.path.join(data_dir, "episodes")
+        print(f"[Dataset] No .npz episodes found, but detected baked regions in '{data_dir}'.")
+        print(f"[Dataset] Generating episodes via LodExtractor & MinecraftNavEnv into '{out_episodes}'...")
+        files = record_episodes(
+            region_dir=data_dir,
+            out_dir=out_episodes,
+            num_episodes=10,
+            ep_len=50,
+            seed=seed,
+        )
+
     if not files:
         raise FileNotFoundError(f"No .npz episode files found in '{data_dir}'.")
 
@@ -85,6 +131,10 @@ def load_episode_splits(
                     f"Episode file '{fpath}' missing both 'shells' and 'voxels' keys. Found: {archive.files}"
                 )
 
+            # Ensure 6D shape (T, 3, 16, 16, 16, 16)
+            if raw_shells.ndim == 5:
+                raw_shells = np.expand_dims(raw_shells, axis=0)
+
             # Ensure uint8 [0..255] is normalized to float32 [0.0..1.0]
             if raw_shells.dtype == np.uint8 or raw_shells.max() > 1.5:
                 shells = normalize_shells(raw_shells)
@@ -96,18 +146,24 @@ def load_episode_splits(
             # 2. State
             if "state" in archive:
                 state = np.asarray(archive["state"], dtype=np.float32)
+                if state.ndim == 1 and T == 1:
+                    state = np.expand_dims(state, axis=0)
             else:
                 state = np.zeros((T, 12), dtype=np.float32)
 
             # 3. Action
             if "action" in archive:
                 action = np.asarray(archive["action"], dtype=np.int32)
+                if action.ndim == 0 and T == 1:
+                    action = np.expand_dims(action, axis=0)
             else:
                 action = np.zeros((T,), dtype=np.int32)
 
             # 4. Meta
             if "meta" in archive:
                 meta = np.asarray(archive["meta"], dtype=np.float32)
+                if meta.ndim == 1 and T == 1:
+                    meta = np.expand_dims(meta, axis=0)
             else:
                 meta = np.zeros((T, 6), dtype=np.float32)
 

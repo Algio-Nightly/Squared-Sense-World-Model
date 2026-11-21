@@ -14,21 +14,56 @@ from .palette import BlockPalette, get_palette
 class MoveOutcome(Enum):
     SUCCESS = 0         # Standard flat move (same Y)
     STEP_UP = 1         # Stepped up 1 block onto solid obstacle
-    FALL = 2            # Stepped off ledge and landed safely (fall distance <= 5)
+    FALL = 2            # Stepped off ledge and landed safely (fall distance <= max_safe_fall)
     BLOCKED = 3         # Move blocked by wall, low ceiling, or lack of step-up clearance
-    FATAL_FALL = 4      # Fell > 5 blocks
+    FATAL_FALL = 4      # Fell > max_safe_fall blocks
     FATAL_HAZARD = 5    # Landed on or walked into lava/fire/hazard
     FATAL_VOID = 6      # Fell into void below world minimum Y
+
+
+class VoxelCourseAdapter:
+    """Adapts a 16-channel uint8 (16, X, Y, Z) course volume into a block query interface."""
+
+    def __init__(self, volume: np.ndarray, palette_obj: Optional[BlockPalette] = None):
+        self.volume = volume
+        self.palette = palette_obj or get_palette()
+        self.c_dim, self.x_dim, self.y_dim, self.z_dim = volume.shape
+        self.air_id = self.palette.block_to_id.get("minecraft:air", 0)
+        self.stone_id = self.palette.block_to_id.get("minecraft:stone", 2)
+        self.lava_id = self.palette.block_to_id.get("minecraft:lava", 478)
+
+    def get_block(self, x: int, y: int, z: int) -> int:
+        if x < 0 or x >= self.x_dim or y < 0 or y >= self.y_dim or z < 0 or z >= self.z_dim:
+            return self.stone_id  # Bounds barrier
+        # Channel 2: HAZARD
+        if self.volume[2, x, y, z] >= 128:
+            return self.lava_id
+        # Channel 0: TERRAIN, Channel 7: COLLISION_HEIGHT
+        if self.volume[0, x, y, z] >= 128 or self.volume[7, x, y, z] >= 128:
+            return self.stone_id
+        return self.air_id
+
+    def is_solid(self, x: int, y: int, z: int) -> bool:
+        b = self.get_block(x, y, z)
+        return bool(self.palette.lut_is_solid[b])
+
+    def is_hazard(self, x: int, y: int, z: int) -> bool:
+        b = self.get_block(x, y, z)
+        return bool(self.palette.lut_hazard[b] > 0.0)
 
 
 class MovementPhysicsKernel:
     """
     Simulates discrete 1x2x1 player locomotion in Minecraft voxel worlds.
+    Supports both WorldVolume memmaps and 16-channel course volumes (via VoxelCourseAdapter).
     """
 
     def __init__(self, world_volume, palette_obj: Optional[BlockPalette] = None, max_safe_fall: int = 5):
-        self.world = world_volume
         self.palette = palette_obj or get_palette()
+        if isinstance(world_volume, np.ndarray) and world_volume.ndim == 4:
+            self.world = VoxelCourseAdapter(world_volume, self.palette)
+        else:
+            self.world = world_volume
         self.max_safe_fall = max_safe_fall
 
     def is_passable_air(self, block_id: int) -> bool:

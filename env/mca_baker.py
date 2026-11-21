@@ -1,7 +1,7 @@
 """
 Fast Binary MCA Region Baker.
 Converts Minecraft Anvil (.mca) region files into flat, read-only NumPy memory-mapped
-arrays (.mmap / .npy) for microsecond zero-copy access during RL training and inference.
+arrays (.mmap / .npz) for microsecond zero-copy access during RL training and inference.
 """
 
 import argparse
@@ -25,7 +25,7 @@ except ImportError:
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if ROOT_DIR not in sys.path:
         sys.path.insert(0, ROOT_DIR)
-    from offline.palette import BlockPalette, get_palette
+    from env.palette import BlockPalette, get_palette
 
 # Modern Minecraft World Height Bounds (1.18+ / 1.20+ / 1.21)
 WORLD_MIN_Y = -64
@@ -98,7 +98,7 @@ def bake_region(
     Bakes a single .mca region file into a memory-mapped array of shape (512, 384, 512).
     Saves:
     - r.X.Z.mmap: binary memmap file of uint16 block IDs
-    - r.X.Z.heightmap.npy: 2D array (512, 512) of int16 surface world Y
+    - r.X.Z.heightmap.npz: compressed archive of 2D array (512, 512) int16 surface world Y
     - r.X.Z.json: metadata manifest
     """
     if palette_obj is None:
@@ -112,7 +112,7 @@ def bake_region(
     os.makedirs(output_dir, exist_ok=True)
     mmap_filename = f"r.{reg_x}.{reg_z}.mmap"
     mmap_path = os.path.join(output_dir, mmap_filename)
-    heightmap_path = os.path.join(output_dir, f"r.{reg_x}.{reg_z}.heightmap.npy")
+    heightmap_path = os.path.join(output_dir, f"r.{reg_x}.{reg_z}.heightmap.npz")
     json_path = os.path.join(output_dir, f"r.{reg_x}.{reg_z}.json")
 
     if not overwrite and os.path.exists(mmap_path) and os.path.exists(json_path):
@@ -185,7 +185,7 @@ def bake_region(
     highest_reversed_idx = np.argmax(reversed_solid, axis=1)
     highest_y_idx = np.where(has_any, (WORLD_HEIGHT - 1) - highest_reversed_idx, 0)
     world_y_heightmap = (highest_y_idx + WORLD_MIN_Y).astype(np.int16)
-    np.save(heightmap_path, world_y_heightmap)
+    np.savez_compressed(heightmap_path, heightmap=world_y_heightmap)
 
     elapsed = time.time() - start_time
     non_air_count = int(np.count_nonzero(region_blocks != 0))
@@ -208,7 +208,7 @@ def bake_region(
         "non_air_blocks": non_air_count,
         "bake_time_seconds": round(elapsed, 2),
         "mmap_file": mmap_filename,
-        "heightmap_file": os.path.basename(heightmap_path)
+        "heightmap_file": os.path.basename(heightmap_path),
     }
 
     with open(json_path, "w", encoding="utf-8") as f:
@@ -284,8 +284,8 @@ def bake_world(
 
 def main():
     parser = argparse.ArgumentParser(description="Bake Minecraft .mca region files into NumPy memmap arrays.")
-    parser.add_argument("--input", "--input-dir", "-i", dest="input", type=str, required=True, help="Path to .mca file or directory containing .mca files.")
-    parser.add_argument("--output", "--output-dir", "-o", dest="output", type=str, required=True, help="Output directory for baked .mmap and metadata files.")
+    parser.add_argument("--input", "--input-dir", "--world_dir", "--world-dir", "-i", dest="input", type=str, required=True, help="Path to .mca file or directory containing .mca files.")
+    parser.add_argument("--output", "--output-dir", "--output_dir", "-o", dest="output", type=str, required=True, help="Output directory for baked .mmap and metadata files.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite already baked files.")
 
     args = parser.parse_args()

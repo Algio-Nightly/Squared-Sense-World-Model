@@ -137,8 +137,18 @@ class LodExtractor:
     Extracts multi-LOD observation tensors (B0, B1, B2) and entity grids from a WorldVolume.
     """
 
-    def __init__(self, world_volume: WorldVolume, palette_obj: Optional[BlockPalette] = None):
-        self.world = world_volume
+    def __init__(
+        self,
+        world_volume: Optional[Union[WorldVolume, str]] = None,
+        palette_obj: Optional[BlockPalette] = None,
+        region_dir: Optional[str] = None,
+    ):
+        target = world_volume if world_volume is not None else region_dir
+        if isinstance(target, str):
+            target = WorldVolume(target, palette_obj=palette_obj)
+        elif target is None:
+            raise ValueError("Either world_volume or region_dir must be provided.")
+        self.world = target
         self.palette = palette_obj or self.world.palette
 
         # Precompute coordinate grids for each LOD
@@ -480,3 +490,34 @@ class LodExtractor:
             "blocks": blocks,
             "entities": entities
         }
+
+    def extract_multi_lod(
+        self,
+        player_pos: Tuple[float, float, float] = (0.0, 64.0, 0.0),
+        cardinal: str = "SOUTH",
+        camera_pitch: float = 0.0,
+        yaw: Optional[float] = None,
+    ) -> Tuple[np.ndarray, Dict]:
+        """Extract multi-LOD observation shells (3, 16, 16, 16, 16) and header metadata."""
+        if yaw is not None:
+            norm = (yaw % 360.0 + 360.0) % 360.0
+            if 45.0 <= norm < 135.0:
+                cardinal = "WEST"
+            elif 135.0 <= norm < 225.0:
+                cardinal = "NORTH"
+            elif 225.0 <= norm < 315.0:
+                cardinal = "EAST"
+            else:
+                cardinal = "SOUTH"
+        int_pos = (int(round(player_pos[0])), int(round(player_pos[1])), int(round(player_pos[2])))
+        obs = self.extract_observation(player_pos=int_pos, cardinal=cardinal, camera_pitch=camera_pitch)
+        shells = np.zeros((3, 16, 16, 16, 16), dtype=np.float32)
+        for lod in range(3):
+            b = obs["blocks"][f"lod{lod}"]
+            shells[lod, ..., 0] = b["occupancy"]
+            shells[lod, ..., 1] = b["passability"]
+            shells[lod, ..., 2] = b["hazard"]
+            shells[lod, ..., 11] = b["light_level"]
+            shells[lod, ..., 13] = b["visibility"]
+            shells[lod, ..., 14] = np.clip(b["hardness"] / 50.0, 0.0, 1.0)
+        return shells, obs["header"]

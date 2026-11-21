@@ -49,20 +49,29 @@ def load_courses_from_dir(
     course_files = sorted(glob.glob(os.path.join(courses_dir, "*.npz")))
     courses = []
     for fpath in course_files:
-        data = np.load(fpath)
-        vol = data["volume"]
-        start = tuple(map(int, data["start"]))
-        waypoints = [tuple(map(int, wp)) for wp in data["waypoints"]]
-        # Compute reference shortest path length
-        l_ref = float(data.get("shortest_path_len", 0.0))
-        if l_ref <= 0.0:
-            curr = np.array(start, dtype=float)
-            total_d = 0.0
-            for wp in waypoints:
-                total_d += float(np.linalg.norm(np.array(wp, dtype=float) - curr))
-                curr = np.array(wp, dtype=float)
-            l_ref = max(1.0, total_d)
-        courses.append((vol, start, waypoints, l_ref))
+        with np.load(fpath) as data:
+            vol = data["volume"] if "volume" in data else data.get("shells", None)
+            if vol is None:
+                continue
+            start = tuple(map(int, data["start"])) if "start" in data else (0, 0, 0)
+            if "waypoints" in data:
+                waypoints = [tuple(map(int, wp)) for wp in data["waypoints"]]
+            else:
+                waypoints = []
+            l_ref = float(data.get("shortest_path_len", 0.0))
+
+            # Compute reference shortest path length if not provided
+            if l_ref <= 0.0 and len(waypoints) > 0:
+                curr = np.array(start, dtype=float)
+                total_d = 0.0
+                for wp in waypoints:
+                    total_d += float(np.linalg.norm(np.array(wp, dtype=float) - curr))
+                    curr = np.array(wp, dtype=float)
+                l_ref = max(1.0, total_d)
+            elif l_ref <= 0.0:
+                l_ref = 1.0
+
+            courses.append((vol, start, waypoints, l_ref))
     return courses
 
 
