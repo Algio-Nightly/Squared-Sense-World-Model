@@ -24,6 +24,12 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import f1_score, r2_score, roc_auc_score
 
+from data.dataset import (
+    compute_local_hazard_labels,
+    compute_occlusion_labels,
+    extract_temporal_clips,
+    load_episode_splits,
+)
 from data.schema import normalize_shells
 from models.baselines import Generative3DMAE, SingleLODJEPA
 from models.temporal_lstm import DualLSTMTemporalIntegrator
@@ -557,66 +563,161 @@ def run_probe_suite(
         num_episodes = 4
         clip_len = 24
         data = generate_synthetic_probe_data(num_episodes=num_episodes, clip_len=clip_len)
+
+        shells = data["shells"]
+        state = data["state"]
+        action = data["action"]
+        meta = data["meta"]
+        hazard = data["hazard"]
+        occlusion = data["occlusion"]
+        ema_targets = data["ema_targets"]
+
+        # 3. Extract frozen representations
+        features = extract_features(
+            model=model,
+            model_type=model_type,
+            shells=shells,
+            state=state,
+            action=action,
+            temporal_model=temporal_model,
+            batch_size=32,
+        )
+
+        # Train/test split by episode ID (NEVER frame shuffle)
+        # Episode 0..2 (72 frames) train, Episode 3 (24 frames) test
+        train_n = 3 * clip_len
+        X_train, X_test = features[:train_n], features[train_n:]
+        y_train_goal, y_test_goal = meta[:train_n, 3:6], meta[train_n:, 3:6]
+        y_train_haz, y_test_haz = hazard[:train_n], hazard[train_n:]
+        v_train, v_test = state[:train_n, 0:3], state[train_n:, 0:3]
+        occ_train, occ_test = occlusion[:train_n], occlusion[train_n:]
+
+        # Multi-step rollout
+        # Shape tokens_seq: (num_episodes, clip_len, 192, 256) or pooled (num_episodes, clip_len, 256)
+        tok_seq = shells.reshape((num_episodes, clip_len, 3, 16, 16, 16, 16))
+        encoder = model.context_encoder if hasattr(model, "context_encoder") else (
+            model.encoder if hasattr(model, "encoder") else model
+        )
+        if model_type in ("b1_lod0",):
+            tok_seq = tok_seq[:, :, 0:1]
+        elif model_type in ("b2_lod2",):
+            tok_seq = tok_seq[:, :, 2:3]
+
+        flat_tok = _forward_tokens(encoder, tok_seq.reshape(-1, *tok_seq.shape[2:]))
+        tokens_seq_4d = flat_tok.reshape((num_episodes, clip_len, flat_tok.shape[1], 256))
+        state_seq = state.reshape((num_episodes, clip_len, 12))
+        action_seq = action.reshape((num_episodes, clip_len))
+
+        rollout_res = eval_multistep_rollout(
+            temporal_model=temporal_model,
+            tokens_seq=tokens_seq_4d,
+            state_seq=state_seq,
+            action_seq=action_seq,
+            ema_targets_seq=ema_targets,
+            horizons=(1, 2, 4, 8),
+        )
     else:
-        raise NotImplementedError(f"Loading real dataset from '{data_dir}' not implemented.")
+        splits = load_episode_splits(data_dir, seed=42)
+        train_eps = splits["train"]
+        test_eps = splits["test"] if len(splits["test"]) > 0 else splits["val"]
 
-    shells = data["shells"]
-    state = data["state"]
-    action = data["action"]
-    meta = data["meta"]
-    hazard = data["hazard"]
-    occlusion = data["occlusion"]
-    ema_targets = data["ema_targets"]
+        def _process_episodes(ep_list: List[Dict[str, np.ndarray]]):
+            sh_list, st_list, ac_list, me_list, hz_list, oc_list = [], [], [], [], [], []
+            for ep in ep_list:
+                sh = ep["shells"]
+                st = ep["state"]
+                ac = ep["action"]
+                me = ep["meta"]
+                hz = compute_local_hazard_labels(sh)
+                oc = compute_occlusion_labels(hz)
 
-    # 3. Extract frozen representations
-    features = extract_features(
-        model=model,
-        model_type=model_type,
-        shells=shells,
-        state=state,
-        action=action,
-        temporal_model=temporal_model,
-        batch_size=32,
-    )
+                sh_list.append(sh)
+                st_list.append(st)
+                ac_list.append(ac)
+                me_list.append(me)
+                hz_list.append(hz)
+                oc_list.append(oc)
 
-    # Train/test split by episode ID (NEVER frame shuffle)
-    # Episode 0..2 (72 frames) train, Episode 3 (24 frames) test
-    train_n = 3 * clip_len
-    X_train, X_test = features[:train_n], features[train_n:]
-    y_train_goal, y_test_goal = meta[:train_n, 3:6], meta[train_n:, 3:6]
-    y_train_haz, y_test_haz = hazard[:train_n], hazard[train_n:]
-    v_train, v_test = state[:train_n, 0:3], state[train_n:, 0:3]
-    occ_train, occ_test = occlusion[:train_n], occlusion[train_n:]
+            cat_sh = np.concatenate(sh_list, axis=0)
+            cat_st = np.concatenate(st_list, axis=0)
+            cat_ac = np.concatenate(ac_list, axis=0)
+            cat_me = np.concatenate(me_list, axis=0)
+            cat_hz = np.concatenate(hz_list, axis=0)
+            cat_oc = np.concatenate(oc_list, axis=0)
+            return cat_sh, cat_st, cat_ac, cat_me, cat_hz, cat_oc
 
-    # 4. Run four probes
+        train_sh, train_st, train_ac, train_me, train_hz, train_oc = _process_episodes(train_eps)
+        test_sh, test_st, test_ac, test_me, test_hz, test_oc = _process_episodes(test_eps)
+
+        X_train = extract_features(
+            model=model,
+            model_type=model_type,
+            shells=train_sh,
+            state=train_st,
+            action=train_ac,
+            temporal_model=temporal_model,
+            batch_size=32,
+        )
+        X_test = extract_features(
+            model=model,
+            model_type=model_type,
+            shells=test_sh,
+            state=test_st,
+            action=test_ac,
+            temporal_model=temporal_model,
+            batch_size=32,
+        )
+
+        y_train_goal, y_test_goal = train_me[:, 3:6], test_me[:, 3:6]
+        y_train_haz, y_test_haz = train_hz, test_hz
+        v_train, v_test = train_st[:, 0:3], test_st[:, 0:3]
+        occ_train, occ_test = train_oc, test_oc
+
+        # Multi-step rollout on test episodes
+        clips = extract_temporal_clips(test_eps, clip_len=24, stride=12)
+        if len(clips["shells"]) == 0:
+            clips = extract_temporal_clips(train_eps, clip_len=24, stride=12)
+
+        clip_shells = clips["shells"]
+        b, T = clip_shells.shape[:2]
+        flat_shells = clip_shells.reshape((b * T, *clip_shells.shape[2:]))
+
+        encoder = model.context_encoder if hasattr(model, "context_encoder") else (
+            model.encoder if hasattr(model, "encoder") else model
+        )
+        target_encoder = model.target_encoder if hasattr(model, "target_encoder") else encoder
+
+        eval_flat_shells = flat_shells
+        if model_type in ("b1_lod0",):
+            eval_flat_shells = flat_shells[:, 0:1]
+        elif model_type in ("b2_lod2",):
+            eval_flat_shells = flat_shells[:, 2:3]
+
+        flat_tok = _forward_tokens(encoder, eval_flat_shells)
+        tokens_seq_4d = flat_tok.reshape((b, T, flat_tok.shape[1], 256))
+
+        # Compute EMA targets directly on the fly
+        target_tokens = _forward_tokens(target_encoder, eval_flat_shells)
+        mean_pooled = jnp.mean(target_tokens, axis=1)  # (b * T, 256)
+        mean = jnp.mean(mean_pooled, axis=-1, keepdims=True)
+        var = jnp.var(mean_pooled, axis=-1, keepdims=True)
+        norm_pooled = (mean_pooled - mean) / jnp.sqrt(var + 1e-6)
+        ema_targets = np.asarray(norm_pooled).reshape((b, T, 256))
+
+        rollout_res = eval_multistep_rollout(
+            temporal_model=temporal_model,
+            tokens_seq=tokens_seq_4d,
+            state_seq=clips["states"],
+            action_seq=clips["actions"],
+            ema_targets_seq=ema_targets,
+            horizons=(1, 2, 4, 8),
+        )
+        features = X_test
+
+    # 4. Run frozen probes
     goal_res = probe_distant_goal(X_train, y_train_goal, X_test, y_test_goal)
     hazard_res = probe_local_hazard(X_train, y_train_haz, X_test, y_test_haz)
     kin_occ_res = probe_kinematic_and_occlusion(X_train, v_train, occ_train, X_test, v_test, occ_test)
-
-    # Multi-step rollout
-    # Shape tokens_seq: (num_episodes, clip_len, 192, 256) or pooled (num_episodes, clip_len, 256)
-    tok_seq = shells.reshape((num_episodes, clip_len, 3, 16, 16, 16, 16))
-    encoder = model.context_encoder if hasattr(model, "context_encoder") else (
-        model.encoder if hasattr(model, "encoder") else model
-    )
-    if model_type in ("b1_lod0",):
-        tok_seq = tok_seq[:, :, 0:1]
-    elif model_type in ("b2_lod2",):
-        tok_seq = tok_seq[:, :, 2:3]
-
-    flat_tok = _forward_tokens(encoder, tok_seq.reshape(-1, *tok_seq.shape[2:]))
-    tokens_seq_4d = flat_tok.reshape((num_episodes, clip_len, flat_tok.shape[1], 256))
-    state_seq = state.reshape((num_episodes, clip_len, 12))
-    action_seq = action.reshape((num_episodes, clip_len))
-
-    rollout_res = eval_multistep_rollout(
-        temporal_model=temporal_model,
-        tokens_seq=tokens_seq_4d,
-        state_seq=state_seq,
-        action_seq=action_seq,
-        ema_targets_seq=ema_targets,
-        horizons=(1, 2, 4, 8),
-    )
 
     # 5. Compile summary table
     summary: Dict[str, Any] = {

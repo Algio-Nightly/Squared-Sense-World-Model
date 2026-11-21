@@ -53,8 +53,8 @@ def test_reset_shapes_and_ranges() -> None:
     assert state.shape == (12,)
     assert state.dtype == np.float32
     # Verify health, food, grounded are reasonable
-    assert state[9] == 20.0  # health
-    assert state[10] == 20.0  # food
+    assert state[9] == 1.0  # health normalized to 1.0
+    assert state[10] == 1.0  # food normalized to 1.0
     assert state[11] == 1.0  # standing on ground
 
     # 3. Goal vector
