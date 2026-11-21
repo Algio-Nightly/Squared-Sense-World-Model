@@ -30,9 +30,6 @@
 MAX_POOL_CHANNELS = [2, 4, 7, 8, 9, 10, 12, 13, 15]
 AVG_POOL_CHANNELS = [0, 1, 3, 5, 6, 11, 14]
 
-MAX_POOL_CHANNELS = [2, 4, 6, 7, 8, 9, 10, 15]
-AVG_POOL_CHANNELS = [0, 1, 3, 5, 11, 12, 13, 14]
-
 ## 3. Concentric Multi-LOD Shell Geometry (All output shapes: `(16, 16, 16, 16)` = C, X, Y, Z)
 - LOD-0 (1x): span 16x16x16 | forward +12 / back -4  | lateral ±8  | base Y -4 / +12
 - LOD-1 (2x): span 32x32x32 | forward +24 / back -8  | lateral ±16 | base Y -8 / +24

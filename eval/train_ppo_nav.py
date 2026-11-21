@@ -704,8 +704,16 @@ def main(args: Optional[List[str]] = None) -> int:
         load_checkpoint(opts.temporal_ckpt, temporal_model)
 
     # 2. Instantiate Environment
-    volume, start, waypoints = make_debug_bridge_course(seed=opts.seed)
-    env = VoxelNavEnv(volume=volume, start=start, waypoints=waypoints)
+    if opts.courses_dir and os.path.isdir(opts.courses_dir):
+        from eval.eval_navigation import load_courses_from_dir
+        courses = load_courses_from_dir(opts.courses_dir)
+        if not courses:
+            raise FileNotFoundError(f"No .npz courses found in {opts.courses_dir}")
+        volume, start, waypoints, _ = courses[0]
+        env = VoxelNavEnv(volume=volume, start=start, waypoints=waypoints, courses=courses)
+    else:
+        volume, start, waypoints = make_debug_bridge_course(seed=opts.seed)
+        env = VoxelNavEnv(volume=volume, start=start, waypoints=waypoints)
 
     # 3. Instantiate Trainable ActorCriticHead & Optax Optimizer
     policy = ActorCriticHead(feat_dim=feat_dim, num_actions=12, rngs=rng)

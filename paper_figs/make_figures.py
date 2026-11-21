@@ -734,6 +734,30 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=600,
         help="Resolution for raster PNG previews (default 600).",
     )
+    parser.add_argument(
+        "--shells_npz",
+        type=str,
+        default=None,
+        help="Path to .npz file containing voxel shells for Figure 2.",
+    )
+    parser.add_argument(
+        "--gating_json",
+        type=str,
+        default=None,
+        help="Path to .json file containing empirical gating stats for Figure 3.",
+    )
+    parser.add_argument(
+        "--nav_json",
+        type=str,
+        default=None,
+        help="Path to .json file containing navigation evaluation outputs for Figure 4.",
+    )
+    parser.add_argument(
+        "--course_npz",
+        type=str,
+        default=None,
+        help="Path to .npz course volume file for Figure 4.",
+    )
     return parser.parse_args(args)
 
 
@@ -746,32 +770,90 @@ def main(args: Optional[List[str]] = None) -> int:
     # 1. Figure 1: Training Loss & RankMe
     metrics_paths = None
     if opts.metrics_dir and os.path.isdir(opts.metrics_dir):
-        metrics_paths = {
-            "M1 (Full Dual-LSTM)": os.path.join(opts.metrics_dir, "m1_metrics.jsonl"),
-            "M2 (Static Spatial JEPA)": os.path.join(opts.metrics_dir, "m2_metrics.jsonl"),
-            "B1 (LOD-0 Only)": os.path.join(opts.metrics_dir, "b1_metrics.jsonl"),
-            "B3 (Generative 3D-MAE)": os.path.join(opts.metrics_dir, "b3_metrics.jsonl"),
-        }
+        def _find_metric(prefix_name: str, subdirs: List[str]) -> Optional[str]:
+            p1 = os.path.join(opts.metrics_dir, f"{prefix_name}_metrics.jsonl")
+            if os.path.isfile(p1):
+                return p1
+            for sub in subdirs:
+                p2 = os.path.join(opts.metrics_dir, sub, "metrics.jsonl")
+                if os.path.isfile(p2):
+                    return p2
+            return None
+
+        m1_path = _find_metric("m1", ["m1_full_temporal", "m1_temporal"])
+        m2_path = _find_metric("m2", ["m2_spatial_jepa", "m2_spatial"])
+        b1_path = _find_metric("b1", [os.path.join("baselines", "b1_lod0"), "b1_lod0"])
+        b3_path = _find_metric("b3", [os.path.join("baselines", "b3_mae"), "b3_mae"])
+
+        metrics_paths = {}
+        if m1_path: metrics_paths["M1 (Full Dual-LSTM)"] = m1_path
+        if m2_path: metrics_paths["M2 (Static Spatial JEPA)"] = m2_path
+        if b1_path: metrics_paths["B1 (LOD-0 Only)"] = b1_path
+        if b3_path: metrics_paths["B3 (Generative 3D-MAE)"] = b3_path
+
     plot_training_and_rankme(metrics_paths=metrics_paths, out_dir=opts.out_dir, dpi=opts.dpi)
 
     # 2. Figure 2: DINO-Style 3D Voxel Patch Similarity
     backbone = None
     shells = None
-    if not opts.demo and opts.ckpt and os.path.isfile(opts.ckpt):
-        try:
-            rng = nnx.Rngs(42)
-            backbone = SpatialJEPA(num_shells=3, rngs=rng)
-            from train.checkpoint import load_checkpoint
-            load_checkpoint(opts.ckpt, backbone)
-        except Exception as e:
-            print(f"Warning: Could not load checkpoint ({e}), using default initialization.")
+    if not opts.demo:
+        if opts.ckpt and os.path.isfile(opts.ckpt):
+            try:
+                rng = nnx.Rngs(42)
+                backbone = SpatialJEPA(num_shells=3, rngs=rng)
+                from train.checkpoint import load_checkpoint
+                load_checkpoint(opts.ckpt, backbone)
+            except Exception as e:
+                print(f"Warning: Could not load checkpoint ({e}), using default initialization.")
+        if opts.shells_npz and os.path.isfile(opts.shells_npz):
+            try:
+                with np.load(opts.shells_npz) as arc:
+                    key = "shells" if "shells" in arc else ("voxels" if "voxels" in arc else arc.files[0])
+                    raw_s = arc[key]
+                    if raw_s.dtype == np.uint8 or raw_s.max() > 1.5:
+                        from data.schema import normalize_shells
+                        raw_s = normalize_shells(raw_s)
+                    if raw_s.ndim == 6:
+                        shells = raw_s[0]
+                    else:
+                        shells = raw_s
+            except Exception as e:
+                print(f"Warning: Could not load shells from {opts.shells_npz} ({e}).")
+
     plot_3d_patch_similarity(backbone=backbone, shells_single=shells, query_idx=36, out_dir=opts.out_dir, dpi=opts.dpi)
 
     # 3. Figure 3: Gating Efficiency
-    plot_gating_efficiency(gating_stats=None, out_dir=opts.out_dir, dpi=opts.dpi)
+    gating_stats = None
+    if not opts.demo and opts.gating_json and os.path.isfile(opts.gating_json):
+        try:
+            with open(opts.gating_json, "r", encoding="utf-8") as f:
+                gating_stats = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load gating stats ({e}).")
+    plot_gating_efficiency(gating_stats=gating_stats, out_dir=opts.out_dir, dpi=opts.dpi)
 
     # 4. Figure 4: Navigation Trajectories
-    plot_navigation_trajectories(volume=None, astar_path=None, model_paths=None, waypoints=None, out_dir=opts.out_dir, dpi=opts.dpi)
+    vol = None
+    wps = None
+    model_paths = None
+    if not opts.demo:
+        if opts.course_npz and os.path.isfile(opts.course_npz):
+            try:
+                with np.load(opts.course_npz) as c_data:
+                    vol = c_data["volume"]
+                    wps = [tuple(map(int, w)) for w in c_data["waypoints"]]
+            except Exception as e:
+                print(f"Warning: Could not load course from {opts.course_npz} ({e}).")
+        if opts.nav_json and os.path.isfile(opts.nav_json):
+            try:
+                with open(opts.nav_json, "r", encoding="utf-8") as f:
+                    nav_data = json.load(f)
+                    if "model_paths" in nav_data:
+                        model_paths = nav_data["model_paths"]
+            except Exception as e:
+                print(f"Warning: Could not load nav paths from {opts.nav_json} ({e}).")
+
+    plot_navigation_trajectories(volume=vol, model_paths=model_paths, waypoints=wps, out_dir=opts.out_dir, dpi=opts.dpi)
 
     print("\nAll 4 Springer LNEE vector figures (.pdf) and 600 DPI previews (.png) successfully generated!")
     return 0
