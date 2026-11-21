@@ -116,3 +116,49 @@ def test_jax_policy_forward_with_minecraft_env(test_regions_dir):
     assert values.shape == (1,)
     assert jnp.all(jnp.isfinite(logits))
     assert jnp.all(jnp.isfinite(values))
+
+
+def test_minecraft_ipc_reader_interface():
+    """Verify MinecraftIpcReader initializes and exposes expected API methods."""
+    from env.mc_ipc_reader import MinecraftIpcReader, resolve_default_shm_path
+
+    reader = MinecraftIpcReader(shm_path="test_nonexistent.bin")
+    assert reader.shm_path == "test_nonexistent.bin"
+    assert not reader.is_open()
+    assert not reader.open()
+    assert reader.read_header() is None
+    assert reader.read_inference_telemetry() is None
+    assert resolve_default_shm_path().endswith("squared_sense_mc.bin")
+
+
+def test_record_episodes_e2e(tmp_path, test_regions_dir):
+    """Verify record_episodes generates valid Option B .npz episodes loadable by dataset loader."""
+    from env.record_episodes import record_episodes
+    from data.dataset import load_episode_splits
+
+    out_dir = str(tmp_path / "episodes")
+    files = record_episodes(
+        region_dir=test_regions_dir,
+        out_dir=out_dir,
+        num_episodes=3,
+        ep_len=5,
+        seed=101,
+        policy="random",
+    )
+    assert len(files) == 3
+    for f in files:
+        assert os.path.isfile(f)
+
+    # Verify loading via data/dataset.py:load_episode_splits
+    splits = load_episode_splits(out_dir, seed=42)
+    assert "train" in splits and "val" in splits and "test" in splits
+    all_eps = splits["train"] + splits["val"] + splits["test"]
+    assert len(all_eps) >= 3
+
+    ep0 = all_eps[0]
+    assert ep0["shells"].ndim == 6  # (T, 3, 16, 16, 16, 16)
+    assert ep0["shells"].shape[1:] == (3, 16, 16, 16, 16)
+    assert ep0["shells"].dtype == np.float32
+    assert ep0["state"].shape[1] == 12
+    assert ep0["action"].ndim == 1
+    assert ep0["meta"].shape[1] == 6

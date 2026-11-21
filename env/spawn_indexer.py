@@ -23,8 +23,8 @@ except ImportError:
     ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if ROOT_DIR not in sys.path:
         sys.path.insert(0, ROOT_DIR)
-    from offline.mca_baker import REGION_BLOCKS, WORLD_HEIGHT, WORLD_MIN_Y
-    from offline.palette import BlockPalette, get_palette
+    from env.mca_baker import REGION_BLOCKS, WORLD_HEIGHT, WORLD_MIN_Y
+    from env.palette import BlockPalette, get_palette
 
 
 def compute_surface_gradient(heightmap: np.ndarray) -> np.ndarray:
@@ -71,7 +71,8 @@ def index_region_spawns(
     min_wz = meta["min_world_z"]
 
     mmap = np.memmap(mmap_path, dtype=np.uint16, mode="r", shape=(REGION_BLOCKS, WORLD_HEIGHT, REGION_BLOCKS))
-    heightmap = np.load(heightmap_path)  # (512, 512) int16
+    with np.load(heightmap_path) as h_data:
+        heightmap = h_data["heightmap"] if "heightmap" in h_data else h_data[h_data.files[0]]
 
     # 1. Gradient & Steep Surface Mask
     grad = compute_surface_gradient(heightmap)
@@ -185,7 +186,7 @@ def index_and_save_region_spawns(
         npz_path,
         surface=pools["surface"],
         subterranean=pools["subterranean"],
-        steep=pools["steep"]
+        steep=pools["steep"],
     )
 
     elapsed = time.time() - start
@@ -197,7 +198,7 @@ def index_and_save_region_spawns(
         "steep_count": len(pools["steep"]),
         "total_spawns": len(pools["surface"]) + len(pools["subterranean"]) + len(pools["steep"]),
         "elapsed_seconds": round(elapsed, 2),
-        "spawns_file": os.path.basename(npz_path)
+        "spawns_file": os.path.basename(npz_path),
     }
 
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -235,13 +236,13 @@ class SpawnSampler:
 
     @classmethod
     def from_npz(cls, npz_path: str, weights: Tuple[float, float, float] = (0.60, 0.25, 0.15)) -> "SpawnSampler":
-        data = np.load(npz_path)
-        return cls(
-            surface_spawns=data["surface"],
-            subterranean_spawns=data["subterranean"],
-            steep_spawns=data["steep"],
-            weights=weights
-        )
+        with np.load(npz_path) as data:
+            return cls(
+                surface_spawns=data["surface"],
+                subterranean_spawns=data["subterranean"],
+                steep_spawns=data["steep"],
+                weights=weights
+            )
 
     def sample(self, rng: Optional[np.random.Generator] = None) -> Tuple[int, int, int]:
         """Samples a single (wx, wy, wz) spawn point according to curriculum weights."""
@@ -284,7 +285,7 @@ class SpawnSampler:
 
 def main():
     parser = argparse.ArgumentParser(description="Precompute terrain spawn index from baked memmap.")
-    parser.add_argument("--dir", "-d", type=str, required=True, help="Directory containing baked .mmap and .json files.")
+    parser.add_argument("--dir", "--region_dir", "--region-dir", "-d", dest="dir", type=str, required=True, help="Directory containing baked .mmap and .json files.")
     parser.add_argument("--region", "-r", type=str, default=None, help="Optional specific region like r.-1.2.")
 
     args = parser.parse_args()

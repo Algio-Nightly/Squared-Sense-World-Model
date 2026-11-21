@@ -34,6 +34,8 @@ from data.schema import (
     Channel,
     normalize_shells,
 )
+from env.palette import get_palette
+from env.physics_kernel import MovementPhysicsKernel, MoveOutcome, VoxelCourseAdapter
 
 
 # Module-level channel indexing lists for ultra-fast pooling
@@ -49,13 +51,13 @@ try:
     from data.shell_extractor import CardinalSnapper, extract_shells
 except ImportError:
     class CardinalSnapper:
-        """Cardinals yaw snapping with ±15° rotational hysteresis deadband.
+        """Cardinals yaw snapping with ±10° rotational hysteresis deadband.
 
         Snaps yaw to nearest 90° cardinal axis (0°, 90°, 180°, 270°) and retains
-        the snapped direction until yaw departs by more than 45° + deadband (60°).
+        the snapped direction until yaw departs by more than 45° + deadband (55° for 10°).
         """
 
-        def __init__(self, initial_yaw: float = 0.0, deadband: float = 15.0) -> None:
+        def __init__(self, initial_yaw: float = 0.0, deadband: float = 10.0) -> None:
             self.deadband = deadband
             self.snapped_yaw = self._nearest_cardinal(initial_yaw)
 
@@ -86,6 +88,8 @@ except ImportError:
         use_salience_pool: bool = True,
         snapper: Optional[CardinalSnapper] = None,
         is_padded: bool = False,
+        forward_anchor: int = 2,
+        foot_anchor: int = 6,
     ) -> np.ndarray:
         """Extract multi-LOD concentric voxel shells centered at agent position.
 
@@ -98,6 +102,8 @@ except ImportError:
               avg-pooling on AVG_POOL_CHANNELS; if False, uses strided subsampling.
             snapper: Optional CardinalSnapper instance.
             is_padded: Whether volume has 64-voxel margin padding.
+            forward_anchor: Player forward anchor index in grid (default 2 matching mod).
+            foot_anchor: Player vertical foot index in grid (default 6 matching mod).
 
         Returns:
             (3, 16, 16, 16, 16) float32 array in [0.0, 1.0] with channel-last layout (LOD, X, Y, Z, C).
@@ -120,25 +126,30 @@ except ImportError:
             span = 16 * scale
             shift_y = int(round(4.0 * math.sin(math.radians(pitch)))) * scale
 
+            rear_offset = forward_anchor * scale
+            front_offset = (16 - forward_anchor) * scale
+            below_offset = foot_anchor * scale
+            above_offset = (16 - foot_anchor) * scale
+
             if cardinal_yaw == 0.0:
                 x_min, x_max = px - 8 * scale, px + 8 * scale
-                z_min, z_max = pz - 4 * scale, pz + 12 * scale
+                z_min, z_max = pz - rear_offset, pz + front_offset
                 rot_k = 0
             elif cardinal_yaw == 90.0:
-                x_min, x_max = px - 4 * scale, px + 12 * scale
+                x_min, x_max = px - rear_offset, px + front_offset
                 z_min, z_max = pz - 8 * scale, pz + 8 * scale
                 rot_k = 1
             elif cardinal_yaw == 180.0:
                 x_min, x_max = px - 8 * scale, px + 8 * scale
-                z_min, z_max = pz - 12 * scale, pz + 4 * scale
+                z_min, z_max = pz - front_offset, pz + rear_offset
                 rot_k = 2
             else:  # 270.0
-                x_min, x_max = px - 12 * scale, px + 4 * scale
+                x_min, x_max = px - front_offset, px + rear_offset
                 z_min, z_max = pz - 8 * scale, pz + 8 * scale
                 rot_k = 3
 
-            y_min = py - 4 * scale + shift_y
-            y_max = py + 12 * scale + shift_y
+            y_min = py - below_offset + shift_y
+            y_max = py + above_offset + shift_y
 
             if is_padded or (x_min >= 0 and x_max <= x_dim and y_min >= 0 and y_max <= y_dim and z_min >= 0 and z_max <= z_dim):
                 crop = volume[:, x_min:x_max, y_min:y_max, z_min:z_max]
@@ -304,6 +315,11 @@ class VoxelNavEnv:
         self.max_steps = max_steps
         self.use_salience_pool = use_salience_pool
 
+        # Consolidated MovementPhysicsKernel & VoxelCourseAdapter
+        self.palette = get_palette()
+        self.adapter = VoxelCourseAdapter(self.volume, self.palette)
+        self.kernel = MovementPhysicsKernel(self.adapter, self.palette, max_safe_fall=2)
+
         # State tracking
         self.pos = np.array(self.start, dtype=int)
         self.prev_pos = np.copy(self.pos)
@@ -352,18 +368,11 @@ class VoxelNavEnv:
 
     def _is_solid(self, x: int, y: int, z: int) -> bool:
         """Check if voxel is solid walkable terrain."""
-        if x < 0 or x >= 128 or y < 0 or y >= 64 or z < 0 or z >= 128:
-            return True  # Void / world bounds are solid barriers
-        return (
-            self.volume[Channel.TERRAIN, x, y, z] >= 128
-            or self.volume[Channel.COLLISION_HEIGHT, x, y, z] >= 128
-        )
+        return self.adapter.is_solid(x, y, z)
 
     def _is_hazard(self, x: int, y: int, z: int) -> bool:
         """Check if voxel is a hazard (lava, fire, magma)."""
-        if x < 0 or x >= 128 or y < 0 or y >= 64 or z < 0 or z >= 128:
-            return False
-        return self.volume[Channel.HAZARD, x, y, z] >= 128
+        return self.adapter.is_hazard(x, y, z)
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """Construct observation dictionary."""
@@ -430,6 +439,8 @@ class VoxelNavEnv:
             self.padded_volume[:, self.margin : self.margin + 128, self.margin : self.margin + 64, self.margin : self.margin + 128] = self.volume
             self.start = (int(st[0]), int(st[1]), int(st[2]))
             self.waypoints = [(int(w[0]), int(w[1]), int(w[2])) for w in wps]
+            self.adapter = VoxelCourseAdapter(self.volume, self.palette)
+            self.kernel = MovementPhysicsKernel(self.adapter, self.palette, max_safe_fall=2)
 
         self.pos = np.array(self.start, dtype=int)
         self.prev_pos = np.copy(self.pos)
@@ -506,56 +517,27 @@ class VoxelNavEnv:
         else:
             raise ValueError(f"Invalid action {action}. Must be in [0, 11]")
 
-        # Process translation and collision
+        # Process translation and collision via MovementPhysicsKernel
         if move_dx != 0 or move_dz != 0 or step_up_req:
             curr_x, curr_y, curr_z = self.pos
-            tgt_x, tgt_z = curr_x + move_dx, curr_z + move_dz
-
-            # Check obstacle at height curr_y
-            is_obst = self._is_solid(tgt_x, curr_y, tgt_z)
-            is_head_blocked = self._is_solid(tgt_x, curr_y + 1, tgt_z)
-
-            if is_obst or step_up_req:
-                # Attempt 1-block step-up: requires clearance at curr_y + 1 and curr_y + 2
-                can_step_up = (
-                    not self._is_solid(tgt_x, curr_y + 1, tgt_z)
-                    and not self._is_solid(tgt_x, curr_y + 2, tgt_z)
-                    and self._is_solid(tgt_x, curr_y, tgt_z)
-                )
-                if can_step_up:
-                    self.pos = np.array([tgt_x, curr_y + 1, tgt_z], dtype=int)
-                else:
-                    # Wall bump / invalid move
-                    wall_bump = True
-                    reward += -0.1
-            elif is_head_blocked:
-                # Blocked overhead
+            if step_up_req and not self._is_solid(curr_x + move_dx, curr_y, curr_z + move_dz):
                 wall_bump = True
                 reward += -0.1
             else:
-                # Target space is clear; check drop / gravity
-                ground_solid = self._is_solid(tgt_x, curr_y - 1, tgt_z)
-                ground_hazard = self._is_hazard(tgt_x, curr_y - 1, tgt_z)
-
-                if ground_solid:
-                    self.pos = np.array([tgt_x, curr_y, tgt_z], dtype=int)
-                elif ground_hazard:
-                    # Stepped directly into hazard under feet
-                    self.pos = np.array([tgt_x, curr_y, tgt_z], dtype=int)
+                next_x, next_y, next_z, outcome, fall_dist = self.kernel.step(
+                    curr_x, curr_y, curr_z, move_dx, move_dz
+                )
+                if outcome == MoveOutcome.BLOCKED:
+                    wall_bump = True
+                    reward += -0.1
+                elif outcome == MoveOutcome.FATAL_HAZARD:
+                    self.pos = np.array([next_x, next_y, next_z], dtype=int)
                     hazard_stepped = True
-                else:
-                    # Empty air below; apply drop physics
-                    land_y = curr_y - 1
-                    while land_y >= 0 and not self._is_solid(tgt_x, land_y, tgt_z) and not self._is_hazard(tgt_x, land_y, tgt_z):
-                        land_y -= 1
-
-                    dy = (land_y + 1) - curr_y  # Drop distance (negative)
-                    self.pos = np.array([tgt_x, land_y + 1, tgt_z], dtype=int)
-
-                    if self._is_hazard(tgt_x, land_y, tgt_z):
-                        hazard_stepped = True
-                    elif dy <= -3:
-                        fall_penalty = True
+                elif outcome in (MoveOutcome.FATAL_FALL, MoveOutcome.FATAL_VOID):
+                    self.pos = np.array([next_x, next_y, next_z], dtype=int)
+                    fall_penalty = True
+                elif outcome in (MoveOutcome.SUCCESS, MoveOutcome.STEP_UP, MoveOutcome.FALL):
+                    self.pos = np.array([next_x, next_y, next_z], dtype=int)
 
         # Hazard check (stepping into ch 2 >= 128)
         px, py, pz = self.pos

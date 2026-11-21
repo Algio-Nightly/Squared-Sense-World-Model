@@ -512,6 +512,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to evaluation dataset directory.",
     )
     parser.add_argument(
+        "--region_dir",
+        type=str,
+        default=None,
+        help="Path to directory containing baked Minecraft regions (.mmap). If provided and --data_dir is omitted, episodes are loaded or generated directly from baked terrain.",
+    )
+    parser.add_argument(
         "--out_json",
         type=str,
         default=None,
@@ -530,11 +536,13 @@ def run_probe_suite(
     ckpt: Optional[str] = None,
     temporal_ckpt: Optional[str] = None,
     data_dir: Optional[str] = None,
+    region_dir: Optional[str] = None,
     out_json: Optional[str] = None,
     smoke_test: bool = True,
 ) -> Dict[str, Any]:
     """Execute the full frozen representation and dynamics probe suite."""
     rng = nnx.Rngs(42)
+    data_dir = data_dir or region_dir
 
     # 1. Instantiate model
     temporal_model: Optional[DualLSTMTemporalIntegrator] = None
@@ -756,6 +764,7 @@ def main() -> None:
         ckpt=args.ckpt,
         temporal_ckpt=args.temporal_ckpt,
         data_dir=args.data_dir,
+        region_dir=args.region_dir,
         out_json=args.out_json,
         smoke_test=args.smoke_test,
     )

@@ -368,7 +368,7 @@ def train_bc_warmstart(
 # ---------------------------------------------------------------------------
 
 def train_ppo(
-    env: VoxelNavEnv,
+    env: Any,
     backbone: Any,
     policy: ActorCriticHead,
     optimizer: nnx.Optimizer,
@@ -735,7 +735,11 @@ def main(args: Optional[List[str]] = None) -> int:
         load_checkpoint(opts.temporal_ckpt, temporal_model)
 
     # 2. Instantiate Environment
-    if opts.courses_dir and os.path.isdir(opts.courses_dir):
+    if opts.region_dir and os.path.isdir(opts.region_dir):
+        from env.minecraft_env import MinecraftNavEnv
+        print(f"Instantiating MinecraftNavEnv on real terrain from {opts.region_dir}...")
+        env = MinecraftNavEnv(region_dir=opts.region_dir)
+    elif opts.courses_dir and os.path.isdir(opts.courses_dir):
         from eval.eval_navigation import load_courses_from_dir
         courses = load_courses_from_dir(opts.courses_dir)
         if not courses:
