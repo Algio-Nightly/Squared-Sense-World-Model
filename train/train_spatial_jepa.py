@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from data.dataset import concat_episode_shells, load_episode_splits
 from models.transformer import SpatialJEPA, sample_3d_jepa_masks
 from train.checkpoint import load_checkpoint, save_checkpoint
 from train.diagnostics import append_metrics_jsonl, compute_rankme
@@ -215,30 +216,9 @@ def load_dataset(
         val_x = rng.uniform(0.0, 1.0, size=(4, 3, 16, 16, 16, 16)).astype(np.float32)
         return train_x, val_x
 
-    if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"Dataset directory '{data_dir}' does not exist.")
-
-    # Search for common numpy formats
-    npy_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npy")]
-    npz_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npz")]
-
-    if npy_files:
-        arrays = [np.load(f, mmap_mode="r") for f in npy_files]
-        all_data = np.concatenate(arrays, axis=0)
-    elif npz_files:
-        data_list = []
-        for f in npz_files:
-            with np.load(f) as archive:
-                key = "voxels" if "voxels" in archive else archive.files[0]
-                data_list.append(archive[key])
-        all_data = np.concatenate(data_list, axis=0)
-    else:
-        raise FileNotFoundError(f"No .npy or .npz voxel dataset files found in '{data_dir}'.")
-
-    # 90% train, 10% validation split
-    split_idx = max(int(0.9 * len(all_data)), 1)
-    train_x = all_data[:split_idx]
-    val_x = all_data[split_idx:] if split_idx < len(all_data) else all_data[:split_idx]
+    splits = load_episode_splits(data_dir, seed=seed)
+    train_x = concat_episode_shells(splits["train"])
+    val_x = concat_episode_shells(splits["val"])
     return train_x, val_x
 
 

@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from data.dataset import extract_temporal_clips, load_episode_splits
 from models.temporal_lstm import DualLSTMTemporalIntegrator
 from models.transformer import SpatialJEPA, sample_3d_jepa_masks
 from train.checkpoint import load_checkpoint, save_checkpoint
@@ -418,38 +419,9 @@ def load_temporal_dataset(
         }
         return train_data, val_data
 
-    if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"Dataset directory '{data_dir}' does not exist.")
-
-    # Search for npz files containing trajectory clips
-    npz_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npz")]
-    if not npz_files:
-        raise FileNotFoundError(f"No .npz trajectory files found in '{data_dir}'.")
-
-    all_shells, all_states, all_actions = [], [], []
-    for f in npz_files:
-        with np.load(f) as archive:
-            all_shells.append(archive["shells"])
-            all_states.append(archive["state"])
-            all_actions.append(archive["action"])
-
-    shells_arr = np.concatenate(all_shells, axis=0)
-    states_arr = np.concatenate(all_states, axis=0)
-    actions_arr = np.concatenate(all_actions, axis=0)
-
-    n_total = len(shells_arr)
-    split = max(int(0.85 * n_total), 1)
-
-    train_data = {
-        "shells": shells_arr[:split],
-        "states": states_arr[:split],
-        "actions": actions_arr[:split],
-    }
-    val_data = {
-        "shells": shells_arr[split:] if split < n_total else shells_arr[:split],
-        "states": states_arr[split:] if split < n_total else states_arr[:split],
-        "actions": actions_arr[split:] if split < n_total else actions_arr[:split],
-    }
+    splits = load_episode_splits(data_dir, seed=seed)
+    train_data = extract_temporal_clips(splits["train"], clip_len=clip_len, stride=4)
+    val_data = extract_temporal_clips(splits["val"], clip_len=clip_len, stride=4)
     return train_data, val_data
 
 

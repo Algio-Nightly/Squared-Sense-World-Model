@@ -735,10 +735,13 @@ def main(args: Optional[List[str]] = None) -> int:
         load_checkpoint(opts.temporal_ckpt, temporal_model)
 
     # 2. Instantiate Environment
-    if opts.region_dir and os.path.exists(opts.region_dir):
-        print(f"Loading real Minecraft environment from: {opts.region_dir}...")
-        from env.minecraft_env import MinecraftNavEnv
-        env = MinecraftNavEnv(region_dir=opts.region_dir)
+    if opts.courses_dir and os.path.isdir(opts.courses_dir):
+        from eval.eval_navigation import load_courses_from_dir
+        courses = load_courses_from_dir(opts.courses_dir)
+        if not courses:
+            raise FileNotFoundError(f"No .npz courses found in {opts.courses_dir}")
+        volume, start, waypoints, _ = courses[0]
+        env = VoxelNavEnv(volume=volume, start=start, waypoints=waypoints, courses=courses)
     else:
         volume, start, waypoints = make_debug_bridge_course(seed=opts.seed)
         env = VoxelNavEnv(volume=volume, start=start, waypoints=waypoints)

@@ -25,9 +25,11 @@ Tracking implementation progress against `docs/CONTRACT.md`.
   - Average/max channel pooling
 - [ ] **T1.3**: A* oracle baseline (`data/astar_oracle.py`)
   - 3D jump-aware grid search for ground-truth pathfinding
-- [ ] **T1.4**: Dataset loader & validation (`data/dataset.py`)
-  - Episode parsing (`shells`, `state`, `action`, `meta`)
-  - Strict episode ID train/val/test splits (70/15/15)
+- [x] **T1.4**: Unified dataset loader & validation (`data/dataset.py`, `tests/test_real_data_e2e.py`)
+  - Shared episode loader: `load_episode_splits` strictly splitting by episode file ID (70/15/15) without frame-shuffling, reading `"shells"` key first with fallback to `"voxels"`, and enforcing `normalize_shells()` uint8 -> float32 $[0.0, 1.0]$.
+  - Temporal clip extraction: `extract_temporal_clips(clip_len, stride)` cleanly slicing continuous 6D episode trajectories without crossing episode boundaries.
+  - Dynamic probe label derivation: `compute_local_hazard_labels` (4-block lookahead over lava hazard channel 2 $\ge 0.5$) and `compute_occlusion_labels` (local hazard present at $t-5$ and no longer visible at $t$).
+  - End-to-end real-format test suite: `tests/test_real_data_e2e.py` verifying real `.npz` execution across spatial JEPA, temporal JEPA, baselines, probe suite, and PPO navigation.
 - [ ] **T1.5**: Minecraft Java mod export integration (`mod_export/`)
   - `/sqsense export <name>` integration and volume exporter
 
@@ -159,4 +161,19 @@ Tracking implementation progress against `docs/CONTRACT.md`.
       3. `plot_gating_efficiency`: Grouped bar chart with grayscale-safe hatched bars comparing dense (1743.6 MFLOPs) vs. Event-Driven Shell Gating across movement regimes (Stationary, Straight Walking, Bridge Crossing, Obstacle Dodging) with speedup annotations (up to 100% compute savings).
       4. `plot_navigation_trajectories`: Clean 2D top-down and 3D isometric Matplotlib visualizer rendered directly from NumPy voxel arrays, comparing A* oracle path vs. M1 (Squared Sense), B1 (LOD-0 Myopic), and B2 (LOD-2 Coarse).
     - Verified in `tests/test_figures.py` asserting all 4 vector PDF files (>5 KB) and PNG previews are generated cleanly (2 passed).
+
+## Phase 6: Code-First Data & I/O Audit & Unified Loader (Ticket P1)
+- [x] **T6.1**: Data & I/O Master Reference (`docs/DATA_AND_IO_REFERENCE.md`)
+  - Complete code-grounded audit of all loaders, models, trainers, probes, simulators, and figures.
+  - Identified Discrepancies 4.1 through 4.13 across disk formats, axis ordering, pooling modes, and state normalization.
+- [x] **T6.2**: Unified Real-Data Loader & Bugfix Patch (`data/dataset.py`, `tests/test_real_data_e2e.py`)
+  - **Resolved 4.3, 4.4, 4.5, 4.7**: Introduced `data/dataset.py` with `load_episode_splits` and `extract_temporal_clips`, wired into `train/train_spatial_jepa.py`, `train/train_temporal_jepa.py`, `train/train_baselines.py`, and `eval/probe_suite.py`.
+  - **Resolved 4.1 & 4.5**: Replaced `probe_suite.py` `NotImplementedError` with dynamic hazard/occlusion label generators and on-the-fly EMA target computation.
+  - **Resolved 4.2**: Wired `--courses_dir` and multi-course cycling into `eval/train_ppo_nav.py`.
+  - **Resolved 4.8**: Replaced strided subsampling on `_AVG_CH` in `eval/sim_env.py` with true $2\times 2\times 2$ and $4\times 4\times 4$ block average pooling while maintaining max-pooling on `_MAX_CH` and $< 1.0$s 200-step CPU execution.
+  - **Resolved 4.9**: Normalized proprioceptive state vector in `eval/sim_env.py` (`pitch / 90.0`, `health / 20.0`, `food / 20.0`) while preserving metric displacement in `state[0:6]` for 3D ego-motion shift calibration.
+  - **Resolved 4.10**: Added real experimental input flags (`--shells_npz`, `--gating_json`, `--nav_json`, `--course_npz`) and nested metrics directory loading to `paper_figs/make_figures.py`.
+  - **Cleaned Contract**: Removed duplicate conflicting lines 33-34 in `docs/CONTRACT.md`.
+  - **End-to-End Verified**: 11/11 tests green across `tests/test_sim_env.py` and `tests/test_real_data_e2e.py`.
+
 

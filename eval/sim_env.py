@@ -160,10 +160,10 @@ except ImportError:
                 crop = np.rot90(crop, k=rot_k, axes=(1, 3))
 
             if scale == 1:
-                shells[lod_idx] = crop.transpose(1, 2, 3, 0).astype(np.float32) * inv_255
+                np.multiply(crop.transpose(1, 2, 3, 0), inv_255, out=shells[lod_idx], casting="unsafe")
             elif not use_salience_pool:
                 sub = crop[:, ::scale, ::scale, ::scale]
-                shells[lod_idx] = sub.transpose(1, 2, 3, 0).astype(np.float32) * inv_255
+                np.multiply(sub.transpose(1, 2, 3, 0), inv_255, out=shells[lod_idx], casting="unsafe")
             elif scale == 2:
                 m = np.empty((16, 16, 16, 16), dtype=np.uint8)
                 c_max = crop[_MAX_CH]
@@ -171,20 +171,34 @@ except ImportError:
                 m_max = np.maximum(m_max[:, :, 0::2, :], m_max[:, :, 1::2, :])
                 m_max = np.maximum(m_max[:, :, :, 0::2], m_max[:, :, :, 1::2])
                 m[_MAX_CH] = m_max
-                m[_AVG_CH] = crop[_AVG_CH, ::2, ::2, ::2]
-                shells[lod_idx] = m.transpose(1, 2, 3, 0).astype(np.float32) * inv_255
+
+                c_avg = crop[_AVG_CH]
+                a = c_avg[:, 0::2, :, :].astype(np.uint16) + c_avg[:, 1::2, :, :]
+                a = a[:, :, 0::2, :] + a[:, :, 1::2, :]
+                a = a[:, :, :, 0::2] + a[:, :, :, 1::2]
+                m[_AVG_CH] = ((a + 4) >> 3).astype(np.uint8)
+                np.multiply(m.transpose(1, 2, 3, 0), inv_255, out=shells[lod_idx], casting="unsafe")
             else:  # scale == 4
                 m = np.empty((16, 16, 16, 16), dtype=np.uint8)
                 c_max = crop[_MAX_CH]
-                m_max = np.maximum(c_max[:, 0::2, :, :], c_max[:, 1::2, :, :])
-                m_max = np.maximum(m_max[:, 0::2, :, :], m_max[:, 1::2, :, :])
-                m_max = np.maximum(m_max[:, :, 0::2, :], m_max[:, :, 1::2, :])
-                m_max = np.maximum(m_max[:, :, 0::2, :], m_max[:, :, 1::2, :])
-                m_max = np.maximum(m_max[:, :, :, 0::2], m_max[:, :, :, 1::2])
-                m_max = np.maximum(m_max[:, :, :, 0::2], m_max[:, :, :, 1::2])
-                m[_MAX_CH] = m_max
-                m[_AVG_CH] = crop[_AVG_CH, ::4, ::4, ::4]
-                shells[lod_idx] = m.transpose(1, 2, 3, 0).astype(np.float32) * inv_255
+                s1 = np.maximum(c_max[:, 0::2, :, :], c_max[:, 1::2, :, :])
+                s1 = np.maximum(s1[:, :, 0::2, :], s1[:, :, 1::2, :])
+                s1 = np.maximum(s1[:, :, :, 0::2], s1[:, :, :, 1::2])
+
+                s2 = np.maximum(s1[:, 0::2, :, :], s1[:, 1::2, :, :])
+                s2 = np.maximum(s2[:, :, 0::2, :], s2[:, :, 1::2, :])
+                m[_MAX_CH] = np.maximum(s2[:, :, :, 0::2], s2[:, :, :, 1::2])
+
+                c_avg = crop[_AVG_CH]
+                a1 = c_avg[:, 0::2, :, :].astype(np.uint16) + c_avg[:, 1::2, :, :]
+                a1 = a1[:, :, 0::2, :] + a1[:, :, 1::2, :]
+                a1 = a1[:, :, :, 0::2] + a1[:, :, :, 1::2]
+
+                a2 = a1[:, 0::2, :, :] + a1[:, 1::2, :]
+                a2 = a2[:, :, 0::2, :] + a2[:, :, 1::2, :]
+                a2 = a2[:, :, :, 0::2] + a2[:, :, :, 1::2]
+                m[_AVG_CH] = ((a2 + 32) >> 6).astype(np.uint8)
+                np.multiply(m.transpose(1, 2, 3, 0), inv_255, out=shells[lod_idx], casting="unsafe")
 
         return shells
 
@@ -275,7 +289,10 @@ class VoxelNavEnv:
         waypoints: List[Tuple[int, int, int]],
         max_steps: int = 250,
         use_salience_pool: bool = True,
+        courses: Optional[List[Tuple[np.ndarray, Tuple[int, int, int], List[Tuple[int, int, int]], float]]] = None,
     ) -> None:
+        self.courses = courses
+        self.course_idx = 0
         self.volume = np.copy(volume)
         self.margin = 64
         self.padded_volume = np.zeros((16, 128 + 128, 64 + 128, 128 + 128), dtype=np.uint8)
@@ -297,12 +314,16 @@ class VoxelNavEnv:
         self.waypoints_reached = 0
         self.path_length = 0.0
         self.snapper = CardinalSnapper(self.yaw)
+        self._obs_cache_key: Optional[Tuple[int, int, int, float, float, int]] = None
+        self._cached_shells: Optional[np.ndarray] = None
 
         # Invalidate / initialize beacon in volume ch 8
         self._inject_waypoint_beacon(self.active_waypoint_idx)
 
     def _inject_waypoint_beacon(self, wp_idx: int) -> None:
         """Inject active waypoint beacon into ch 8 of volume."""
+        self._obs_cache_key = None
+        self._cached_shells = None
         # Clear existing waypoints in ch 8
         self.volume[Channel.WAYPOINT] = 0
         self.padded_volume[Channel.WAYPOINT] = 0
@@ -346,15 +367,28 @@ class VoxelNavEnv:
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """Construct observation dictionary."""
-        shells = extract_shells(
-            volume=self.padded_volume,
-            pos=self.pos,
-            yaw=self.yaw,
-            pitch=self.pitch,
-            use_salience_pool=self.use_salience_pool,
-            snapper=self.snapper,
-            is_padded=True,
+        cache_key = (
+            int(self.pos[0]),
+            int(self.pos[1]),
+            int(self.pos[2]),
+            float(self.yaw),
+            float(self.pitch),
+            self.active_waypoint_idx,
         )
+        if self._obs_cache_key == cache_key and self._cached_shells is not None:
+            shells = self._cached_shells
+        else:
+            shells = extract_shells(
+                volume=self.padded_volume,
+                pos=self.pos,
+                yaw=self.yaw,
+                pitch=self.pitch,
+                use_salience_pool=self.use_salience_pool,
+                snapper=self.snapper,
+                is_padded=True,
+            )
+            self._obs_cache_key = cache_key
+            self._cached_shells = shells
 
         # Proprioceptive state (12,)
         # [vx, vy, vz, dx, dy, dz, sin_yaw, cos_yaw, pitch, health, food, grounded]
@@ -368,10 +402,10 @@ class VoxelNavEnv:
                 dx, dy, dz,  # dx, dy, dz
                 math.sin(yaw_rad),
                 math.cos(yaw_rad),
-                self.pitch,
-                20.0,        # health
-                20.0,        # food
-                grounded,    # grounded
+                self.pitch / 90.0,
+                20.0 / 20.0,        # health normalized
+                20.0 / 20.0,        # food normalized
+                grounded,           # grounded
             ],
             dtype=np.float32,
         )
@@ -388,6 +422,15 @@ class VoxelNavEnv:
 
     def reset(self) -> Dict[str, np.ndarray]:
         """Reset environment to initial state."""
+        if self.courses and len(self.courses) > 1:
+            vol, st, wps, _ = self.courses[self.course_idx % len(self.courses)]
+            self.course_idx += 1
+            self.volume = np.copy(vol)
+            self.padded_volume[Channel.OUT_OF_BOUNDS] = 255
+            self.padded_volume[:, self.margin : self.margin + 128, self.margin : self.margin + 64, self.margin : self.margin + 128] = self.volume
+            self.start = (int(st[0]), int(st[1]), int(st[2]))
+            self.waypoints = [(int(w[0]), int(w[1]), int(w[2])) for w in wps]
+
         self.pos = np.array(self.start, dtype=int)
         self.prev_pos = np.copy(self.pos)
         self.yaw = 0.0
