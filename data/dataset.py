@@ -17,16 +17,19 @@ def load_episode_splits(
     data_dir: str,
     seed: int = 42,
     ratios: Tuple[float, float, float] = (0.70, 0.15, 0.15),
+    as_uint8: bool = False,
 ) -> Dict[str, List[Dict[str, np.ndarray]]]:
     """Load episode files from directory and split strictly by episode file ID.
 
     Never frame-shuffles across splits. Resolves 'shells' key first before 'voxels',
-    and ensures shells are float32 in [0.0, 1.0].
+    and stores shells either as uint8 in [0..255] (if as_uint8=True) or normalized
+    float32 in [0.0, 1.0] (if as_uint8=False).
 
     Args:
         data_dir: Directory containing episode .npz files.
         seed: Random seed for deterministic episode splitting.
         ratios: (train, val, test) split ratios (default 70% / 15% / 15%).
+        as_uint8: If True, keep voxel shells in uint8 [0..255] in RAM to save 4x memory.
 
     Returns:
         Dictionary with keys 'train', 'val', 'test', each mapping to a list of episode dicts:
@@ -135,11 +138,19 @@ def load_episode_splits(
             if raw_shells.ndim == 5:
                 raw_shells = np.expand_dims(raw_shells, axis=0)
 
-            # Ensure uint8 [0..255] is normalized to float32 [0.0..1.0]
-            if raw_shells.dtype == np.uint8 or raw_shells.max() > 1.5:
-                shells = normalize_shells(raw_shells)
+            # Store shells as uint8 or normalize to float32 [0.0..1.0]
+            if as_uint8:
+                if raw_shells.dtype == np.uint8:
+                    shells = raw_shells
+                elif raw_shells.max() <= 1.0:
+                    shells = (np.clip(raw_shells, 0.0, 1.0) * 255.0).astype(np.uint8)
+                else:
+                    shells = np.clip(raw_shells, 0, 255).astype(np.uint8)
             else:
-                shells = np.asarray(raw_shells, dtype=np.float32)
+                if raw_shells.dtype == np.uint8 or raw_shells.max() > 1.5:
+                    shells = normalize_shells(raw_shells)
+                else:
+                    shells = np.asarray(raw_shells, dtype=np.float32)
 
             T = shells.shape[0]
 
@@ -185,12 +196,141 @@ def load_episode_splits(
 def concat_episode_shells(episodes: Sequence[Dict[str, np.ndarray]]) -> np.ndarray:
     """Concatenate shell arrays across multiple episodes along time/batch axis.
 
+    Avoids redundant memory copying by preallocating the target array.
+
     Returns:
-        (sum_T, 3, 16, 16, 16, 16) float32 array in [0.0, 1.0].
+        (sum_T, 3, 16, 16, 16, 16) array (uint8 or float32 matching input).
     """
     if not episodes:
         return np.zeros((0, 3, 16, 16, 16, 16), dtype=np.float32)
-    return np.concatenate([ep["shells"] for ep in episodes], axis=0)
+    dtype = episodes[0]["shells"].dtype
+    total_len = sum(len(ep["shells"]) for ep in episodes)
+    out = np.empty((total_len, *episodes[0]["shells"].shape[1:]), dtype=dtype)
+    idx = 0
+    for ep in episodes:
+        n = len(ep["shells"])
+        out[idx : idx + n] = ep["shells"]
+        idx += n
+    return out
+
+
+def load_preallocated_dataset(
+    data_dir: str,
+    seed: int = 42,
+    ratios: Tuple[float, float, float] = (0.70, 0.15, 0.15),
+    as_uint8: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Preallocate and load train/val voxel shells directly into single arrays.
+
+    Eliminates intermediate episode dictionary lists and redundant np.concatenate
+    allocations, saving gigabytes of host RAM.
+
+    Returns:
+        Tuple of (train_x, val_x) arrays of shape (N, 3, 16, 16, 16, 16).
+    """
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"Episode directory '{data_dir}' does not exist.")
+
+    has_mmap = any(f.endswith(".mmap") for f in os.listdir(data_dir))
+    has_manifest = os.path.exists(os.path.join(data_dir, "world_manifest.json"))
+    is_region_dir = has_mmap or has_manifest
+
+    def _is_ep_file(fname: str) -> bool:
+        return (
+            fname.endswith(".npz")
+            and not fname.endswith(".heightmap.npz")
+            and not fname.endswith(".spawns.npz")
+        )
+
+    episodes_dir = os.path.join(data_dir, "episodes") if is_region_dir else data_dir
+    files = []
+    if os.path.exists(episodes_dir):
+        files = sorted(
+            [os.path.join(episodes_dir, f) for f in os.listdir(episodes_dir) if _is_ep_file(f)]
+        )
+    if not files and not is_region_dir:
+        episodes_sub = os.path.join(data_dir, "episodes")
+        if os.path.exists(episodes_sub):
+            files = sorted(
+                [os.path.join(episodes_sub, f) for f in os.listdir(episodes_sub) if _is_ep_file(f)]
+            )
+
+    if not files and is_region_dir:
+        from env.record_episodes import record_episodes
+        out_episodes = os.path.join(data_dir, "episodes")
+        files = record_episodes(
+            region_dir=data_dir,
+            out_dir=out_episodes,
+            num_episodes=10,
+            ep_len=50,
+            seed=seed,
+        )
+
+    if not files:
+        raise FileNotFoundError(f"No .npz episode files found in '{data_dir}'.")
+
+    rng = np.random.default_rng(seed)
+    shuffled_files = list(rng.permutation(files))
+    n = len(shuffled_files)
+
+    if n == 1:
+        train_files = shuffled_files
+        val_files = shuffled_files
+    elif n == 2:
+        train_files = [shuffled_files[0]]
+        val_files = [shuffled_files[1]]
+    else:
+        n_train = max(1, int(round(n * ratios[0])))
+        n_val = max(1, int(round(n * ratios[1])))
+        if n_train + n_val >= n:
+            n_train = max(1, n - 2)
+            n_val = 1
+        train_files = shuffled_files[:n_train]
+        val_files = shuffled_files[n_train : n_train + n_val]
+
+    def _get_episode_len(fpath: str) -> int:
+        with np.load(fpath) as archive:
+            key = "shells" if "shells" in archive else "voxels"
+            sh = archive[key]
+            return sh.shape[0] if sh.ndim == 6 else 1
+
+    train_lens = [_get_episode_len(f) for f in train_files]
+    val_lens = [_get_episode_len(f) for f in val_files]
+
+    total_train = sum(train_lens)
+    total_val = sum(val_lens)
+    dtype = np.uint8 if as_uint8 else np.float32
+
+    train_x = np.empty((total_train, 3, 16, 16, 16, 16), dtype=dtype)
+    val_x = np.empty((total_val, 3, 16, 16, 16, 16), dtype=dtype)
+
+    def _fill_split(target_arr: np.ndarray, file_list: List[str]):
+        offset = 0
+        for fpath in file_list:
+            with np.load(fpath) as archive:
+                key = "shells" if "shells" in archive else "voxels"
+                raw = archive[key]
+                if raw.ndim == 5:
+                    raw = np.expand_dims(raw, axis=0)
+                T = raw.shape[0]
+                if as_uint8:
+                    if raw.dtype == np.uint8:
+                        target_arr[offset : offset + T] = raw
+                    elif raw.max() <= 1.0:
+                        target_arr[offset : offset + T] = (np.clip(raw, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    else:
+                        target_arr[offset : offset + T] = np.clip(raw, 0, 255).astype(np.uint8)
+                else:
+                    if raw.dtype == np.uint8 or raw.max() > 1.5:
+                        target_arr[offset : offset + T] = normalize_shells(raw)
+                    else:
+                        target_arr[offset : offset + T] = np.asarray(raw, dtype=np.float32)
+                offset += T
+
+    _fill_split(train_x, train_files)
+    _fill_split(val_x, val_files)
+
+    return train_x, val_x
 
 
 def extract_temporal_clips(

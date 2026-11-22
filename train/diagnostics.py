@@ -7,11 +7,113 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict
+import shutil
+import sys
+import time
+from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+class ProgressBar:
+    """Zero-dependency terminal progress bar with dynamic ETA, step rates, and metric tracking."""
+
+    def __init__(
+        self,
+        total: int,
+        prefix: str = "",
+        bar_len: int = 24,
+        log_every: int = 5,
+        is_tty: Optional[bool] = None,
+    ):
+        self.total = max(1, total)
+        self.prefix = prefix
+        self.bar_len = bar_len
+        self.log_every = max(1, log_every)
+        self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self.start_time = time.time()
+        self._last_line_len = 0
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        s = int(round(seconds))
+        if s < 60:
+            return f"{s:02d}s"
+        m, s = divmod(s, 60)
+        if m < 60:
+            return f"{m:02d}m{s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h:d}h{m:02d}m"
+
+    def update(self, current: int, metrics: Optional[Dict[str, Any]] = None):
+        """Update progress bar display with current step and metrics dict."""
+        now = time.time()
+        elapsed = now - self.start_time
+        rate = elapsed / max(current, 1)
+        remaining = max(0.0, (self.total - current) * rate)
+
+        time_str = f"{rate:5.2f}s/step" if rate >= 1.0 else f"{1.0 / max(rate, 1e-4):5.1f}step/s"
+        eta_str = self._format_time(remaining)
+        elap_str = self._format_time(elapsed)
+
+        metric_parts = []
+        if metrics:
+            for k, v in metrics.items():
+                if isinstance(v, (float, np.floating, jax.Array)):
+                    val = float(v)
+                    if abs(val) < 1e-3 and val != 0:
+                        metric_parts.append(f"{k}: {val:.2e}")
+                    else:
+                        metric_parts.append(f"{k}: {val:.4f}")
+                else:
+                    metric_parts.append(f"{k}: {v}")
+        metrics_str = " | ".join(metric_parts)
+
+        fraction = min(1.0, current / self.total)
+        step_w = len(str(self.total))
+        step_str = f"{current:0{step_w}d}/{self.total:0{step_w}d}"
+
+        filled_len = int(round(self.bar_len * fraction))
+        if 0 < filled_len < self.bar_len:
+            bar = "=" * (filled_len - 1) + ">"
+        else:
+            bar = "=" * filled_len
+        bar = bar.ljust(self.bar_len, "-")
+
+        is_periodic = (current % self.log_every == 0) or (current == self.total)
+
+        if self.is_tty:
+            status = f"\r{self.prefix} [{bar}] {step_str} ({fraction * 100:4.1f}%) | {time_str} | ETA: {eta_str} | {metrics_str}"
+            cols = shutil.get_terminal_size((100, 20)).columns
+            clear_width = max(self._last_line_len, cols - 1)
+
+            if is_periodic and current < self.total:
+                # Clear active bar line and print permanent mini-log line
+                sys.stdout.write("\r" + " " * clear_width + "\r")
+                mini_log = f"  [{self.prefix.strip()} | Step {step_str}] {metrics_str} | {time_str} | Elapsed: {elap_str} | ETA: {eta_str}"
+                sys.stdout.write(mini_log + "\n")
+                sys.stdout.write(status[: cols - 1])
+                sys.stdout.flush()
+                self._last_line_len = len(status[: cols - 1])
+            elif current == self.total:
+                # Finished: clear bar line and print final summary mini-log
+                sys.stdout.write("\r" + " " * clear_width + "\r")
+                mini_log = f"  [{self.prefix.strip()} | Step {step_str}] {metrics_str} | {time_str} | Elapsed: {elap_str}"
+                sys.stdout.write(mini_log + "\n")
+                sys.stdout.flush()
+                self._last_line_len = 0
+            else:
+                sys.stdout.write(status[: cols - 1])
+                sys.stdout.flush()
+                self._last_line_len = len(status[: cols - 1])
+        else:
+            # Non-TTY mode (e.g. redirected output, CI, background log)
+            if is_periodic or current == 1:
+                line = f"  [{self.prefix.strip()} | Step {step_str}] ({fraction * 100:4.1f}%) | {time_str} | Elapsed: {elap_str} | ETA: {eta_str} | {metrics_str}"
+                print(line, flush=True)
+
 
 
 def compute_rankme(embeddings: np.ndarray | jax.Array, eps: float = 1e-7) -> float:
