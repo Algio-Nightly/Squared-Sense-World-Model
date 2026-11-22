@@ -23,6 +23,11 @@ ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+from train.gpu_env import setup_gpu_environment
+
+# Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
+setup_gpu_environment()
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import flax.nnx as nnx
