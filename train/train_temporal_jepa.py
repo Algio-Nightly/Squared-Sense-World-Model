@@ -29,10 +29,6 @@ from train.gpu_env import auto_configure_batching, setup_gpu_environment
 # Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
 setup_gpu_environment()
 
-repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
-
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
