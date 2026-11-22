@@ -31,11 +31,12 @@ MAX_POOL_CHANNELS = [2, 4, 7, 8, 9, 10, 12, 13, 15]
 AVG_POOL_CHANNELS = [0, 1, 3, 5, 6, 11, 14]
 
 ## 3. Concentric Multi-LOD Shell Geometry (All output shapes: `(16, 16, 16, 16)` = C, X, Y, Z)
-- LOD-0 (1x): span 16x16x16 | forward +12 / back -4  | lateral ±8  | base Y -4 / +12
-- LOD-1 (2x): span 32x32x32 | forward +24 / back -8  | lateral ±16 | base Y -8 / +24
-- LOD-2 (4x): span 64x64x64 | forward +48 / back -16 | lateral ±32 | base Y -16 / +48
-- Pitch vertical shift: `shift_y = round(4 * sin(pitch_rad)) * scale` where `scale in {1, 2, 4}`.
-- Cardinal snapping: snap yaw to nearest 90° cardinal axis with ±15° rotational hysteresis deadband.
+- LOD-0 (1x): span 16x16x16 | forward +13 / back -2  | lateral ±8  | base Y -6 / +9 (at default foot index gy=6)
+- LOD-1 (2x): span 32x32x32 | forward +26 / back -4  | lateral ±16 | base Y -12 / +18
+- LOD-2 (4x): span 64x64x64 | forward +52 / back -8  | lateral ±32 | base Y -24 / +36
+- Player Foot Anchor: In local grid coordinates, player feet sit at (gx=8, gy=6, gz=2), standardized with the Fabric mod (ObservationConfig).
+- Pitch vertical shift: `shift_y = round(4 * sin(pitch_rad)) * scale` where `scale in {1, 2, 4}` dynamically shifts vertical foot index gy in [1..12].
+- Cardinal snapping: snap yaw to nearest 90° cardinal axis with ±10° rotational hysteresis deadband (snap departs when departing by > 45° + deadband = 55°).
 
 ## 4. Option B Episode Format (5 Hz trajectories)
 - `shells`: `(T, 3, 16, 16, 16, 16)` uint8   # (Time, LOD, C, X, Y, Z)

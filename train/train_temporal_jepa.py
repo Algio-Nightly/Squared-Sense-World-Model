@@ -51,6 +51,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to dataset directory containing trajectory clips.",
     )
     parser.add_argument(
+        "--region_dir",
+        type=str,
+        default=None,
+        help="Path to directory containing baked Minecraft regions (.mmap). If provided and --data_dir is omitted, episodes are loaded or generated directly from baked terrain.",
+    )
+    parser.add_argument(
         "--save_dir",
         type=str,
         default="checkpoints/m1_full_temporal",
@@ -452,7 +458,8 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
     )
 
     # 2. Load dataset
-    train_dict, val_dict = load_temporal_dataset(args.data_dir, args.smoke_test, args.seed, args.clip_len)
+    effective_data_dir = args.data_dir or args.region_dir
+    train_dict, val_dict = load_temporal_dataset(effective_data_dir, args.smoke_test, args.seed, args.clip_len)
     num_train = len(train_dict["shells"])
     num_val = len(val_dict["shells"])
     steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))

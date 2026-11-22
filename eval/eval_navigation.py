@@ -18,6 +18,11 @@ import math
 import os
 import sys
 import time
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import flax.nnx as nnx
@@ -27,6 +32,9 @@ import numpy as np
 
 from eval.sim_env import VoxelNavEnv, make_debug_bridge_course
 from eval.train_ppo_nav import ActorCriticHead, extract_step_feature
+from env.ipc_emitter import MinecraftIpcEmitter
+from env.ipc_telemetry import InferenceTelemetry
+from env.minecraft_env import MinecraftNavEnv
 from models.baselines import Generative3DMAE, SingleLODJEPA
 from models.gating import DENSE_MFLOPS_PER_STEP, EventDrivenShellGate
 from models.temporal_lstm import DualLSTMTemporalIntegrator
@@ -41,20 +49,29 @@ def load_courses_from_dir(
     course_files = sorted(glob.glob(os.path.join(courses_dir, "*.npz")))
     courses = []
     for fpath in course_files:
-        data = np.load(fpath)
-        vol = data["volume"]
-        start = tuple(map(int, data["start"]))
-        waypoints = [tuple(map(int, wp)) for wp in data["waypoints"]]
-        # Compute reference shortest path length
-        l_ref = float(data.get("shortest_path_len", 0.0))
-        if l_ref <= 0.0:
-            curr = np.array(start, dtype=float)
-            total_d = 0.0
-            for wp in waypoints:
-                total_d += float(np.linalg.norm(np.array(wp, dtype=float) - curr))
-                curr = np.array(wp, dtype=float)
-            l_ref = max(1.0, total_d)
-        courses.append((vol, start, waypoints, l_ref))
+        with np.load(fpath) as data:
+            vol = data["volume"] if "volume" in data else data.get("shells", None)
+            if vol is None:
+                continue
+            start = tuple(map(int, data["start"])) if "start" in data else (0, 0, 0)
+            if "waypoints" in data:
+                waypoints = [tuple(map(int, wp)) for wp in data["waypoints"]]
+            else:
+                waypoints = []
+            l_ref = float(data.get("shortest_path_len", 0.0))
+
+            # Compute reference shortest path length if not provided
+            if l_ref <= 0.0 and len(waypoints) > 0:
+                curr = np.array(start, dtype=float)
+                total_d = 0.0
+                for wp in waypoints:
+                    total_d += float(np.linalg.norm(np.array(wp, dtype=float) - curr))
+                    curr = np.array(wp, dtype=float)
+                l_ref = max(1.0, total_d)
+            elif l_ref <= 0.0:
+                l_ref = 1.0
+
+            courses.append((vol, start, waypoints, l_ref))
     return courses
 
 
@@ -64,6 +81,9 @@ def evaluate_navigation(
     model_type: str = "m2_static",
     temporal_model: Optional[DualLSTMTemporalIntegrator] = None,
     courses: Optional[List[Tuple[np.ndarray, Tuple[int, int, int], List[Tuple[int, int, int]], float]]] = None,
+    region_dir: Optional[str] = None,
+    visualize: bool = False,
+    fps: float = 10.0,
     num_episodes: int = 5,
     max_steps: int = 250,
     use_gating: bool = False,
@@ -79,6 +99,9 @@ def evaluate_navigation(
         model_type: In {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"}.
         temporal_model: Optional DualLSTMTemporalIntegrator for m1_full.
         courses: Optional list of (volume, start, waypoints, shortest_path_len) tuples.
+        region_dir: Optional path to directory containing baked Minecraft region memmaps.
+        visualize: If True, streams live frames and TELM v1 telemetry to shared memory.
+        fps: Playback streaming FPS when visualize is True (0 for unthrottled).
         num_episodes: Number of episodes to evaluate.
         max_steps: Maximum steps allowed per episode.
         use_gating: If True, uses EventDrivenShellGate to conditionally skip compute.
@@ -90,18 +113,27 @@ def evaluate_navigation(
         Structured evaluation metrics dictionary.
     """
     key = jax.random.PRNGKey(seed)
+    emitter: Optional[MinecraftIpcEmitter] = None
+    if visualize:
+        emitter = MinecraftIpcEmitter()
 
-    # 1. Prepare Courses
-    if not courses:
-        # Generate debug bridge courses with different seeds
-        courses = []
-        for i in range(num_episodes):
-            vol, start, wps = make_debug_bridge_course(seed=seed + i)
-            # Distance from (64, 20, 20) to (64, 20, 56) is 36.0 blocks
-            l_ref = float(np.linalg.norm(np.array(wps[-1], dtype=float) - np.array(start, dtype=float)))
-            courses.append((vol, start, wps, max(1.0, l_ref)))
+    # 1. Prepare Environment / Courses
+    use_real_world = bool(region_dir and os.path.exists(region_dir))
+    real_env: Optional[MinecraftNavEnv] = None
+    if use_real_world:
+        real_env = MinecraftNavEnv(region_dir=region_dir, max_steps=max_steps)
+        actual_episodes = num_episodes
+    else:
+        if not courses:
+            # Generate debug bridge courses with different seeds
+            courses = []
+            for i in range(num_episodes):
+                vol, start, wps = make_debug_bridge_course(seed=seed + i)
+                # Distance from (64, 20, 20) to (64, 20, 56) is 36.0 blocks
+                l_ref = float(np.linalg.norm(np.array(wps[-1], dtype=float) - np.array(start, dtype=float)))
+                courses.append((vol, start, wps, max(1.0, l_ref)))
+        actual_episodes = min(num_episodes, len(courses))
 
-    actual_episodes = min(num_episodes, len(courses))
     success_list = []
     spl_list = []
     waypoint_reached_list = []
@@ -111,6 +143,7 @@ def evaluate_navigation(
 
     total_infer_time = 0.0
     total_steps = 0
+    step_delay = 1.0 / fps if (visualize and fps > 0) else 0.0
 
     # 2. Setup Gating Wrapper if enabled
     gate: Optional[EventDrivenShellGate] = None
@@ -119,64 +152,118 @@ def evaluate_navigation(
             enc = backbone.context_encoder if hasattr(backbone, "context_encoder") else backbone
             gate = EventDrivenShellGate(backbone=enc, tau_gate=tau_gate)
         else:
-            # Gating on other models defaults to dense if not multi-LOD
             gate = None
 
-    # 3. Evaluation Loop
-    for ep_idx in range(actual_episodes):
-        vol, start, waypoints, l_ref = courses[ep_idx]
-        env = VoxelNavEnv(volume=vol, start=start, waypoints=waypoints, max_steps=max_steps)
-        obs = env.reset()
+    try:
+        # 3. Evaluation Loop
+        for ep_idx in range(actual_episodes):
+            if use_real_world and real_env is not None:
+                env = real_env
+                obs = env.reset()
+                l_ref = float(getattr(env, "shortest_path_len", 10.0))
+                waypoints = [tuple(getattr(env, "target_pos", (0, 0, 0)))]
+                curr_player = getattr(env, "player_pos", np.array([0, 64, 0]))
+                target_tuple = tuple(getattr(env, "target_pos", (0, 64, 10)))
+                optimal_path = getattr(env, "optimal_path", [])
+            else:
+                vol, start, waypoints, l_ref = courses[ep_idx]
+                env = VoxelNavEnv(volume=vol, start=start, waypoints=waypoints, max_steps=max_steps)
+                obs = env.reset()
+                curr_player = start
+                target_tuple = waypoints[-1] if waypoints else (0, 0, 0)
+                optimal_path = waypoints
 
-        if gate is not None:
-            gate.reset()
+            breadcrumbs = [tuple(curr_player)]
+            bfs_tuples = [tuple(p) for p in optimal_path]
 
-        temporal_hidden = None
-        done = False
-        step_count = 0
-        last_info: Dict[str, Any] = {}
-
-        while not done and step_count < max_steps:
-            step_count += 1
-            total_steps += 1
-
-            # Feature extraction with latency measurement
-            t0 = time.perf_counter()
             if gate is not None:
-                # Gated inference
-                tokens = gate.step(obs["shells"])
-                feat = jnp.mean(tokens, axis=1)  # (1, 256)
-                if model_type == "m1_full" and temporal_model is not None:
-                    if temporal_hidden is None:
-                        temporal_hidden = temporal_model.init_hidden(1)
-                    s_arr = jnp.asarray(obs["state"], dtype=jnp.float32).reshape((1, 12))
-                    a_arr = jnp.zeros((1,), dtype=jnp.int32)
-                    _, c_t, temporal_hidden = temporal_model.step(tokens, s_arr, a_arr, temporal_hidden)
-                    feat = jnp.concatenate([feat, c_t], axis=-1)
-            else:
-                # Dense inference
-                feat, temporal_hidden = extract_step_feature(
-                    backbone=backbone,
-                    model_type=model_type,
-                    shells=obs["shells"],
-                    state=obs["state"],
-                    temporal_model=temporal_model,
-                    temporal_hidden=temporal_hidden,
-                )
-            t_infer = time.perf_counter() - t0
-            total_infer_time += t_infer
+                gate.reset()
 
-            # Policy forward pass
-            goal_v = obs["goal_vec"]
-            logits, _ = policy(feat, goal_v)
+            temporal_hidden = None
+            done = False
+            step_count = 0
+            ep_return = 0.0
+            last_info: Dict[str, Any] = {}
 
-            if greedy:
-                action = int(jnp.argmax(logits[0]))
-            else:
-                key, subkey = jax.random.split(key)
-                action = int(jax.random.categorical(subkey, logits[0]))
+            while not done and step_count < max_steps:
+                step_t0 = time.perf_counter()
+                step_count += 1
+                total_steps += 1
 
-            obs, reward, done, last_info = env.step(action)
+                # Feature extraction with latency measurement
+                t0 = time.perf_counter()
+                if gate is not None:
+                    tokens = gate.step(obs["shells"])
+                    feat = jnp.mean(tokens, axis=1)  # (1, 256)
+                    if model_type == "m1_full" and temporal_model is not None:
+                        if temporal_hidden is None:
+                            temporal_hidden = temporal_model.init_hidden(1)
+                        s_arr = jnp.asarray(obs["state"], dtype=jnp.float32).reshape((1, 12))
+                        a_arr = jnp.zeros((1,), dtype=jnp.int32)
+                        _, c_t, temporal_hidden = temporal_model.step(tokens, s_arr, a_arr, temporal_hidden)
+                        feat = jnp.concatenate([feat, c_t], axis=-1)
+                else:
+                    feat, temporal_hidden = extract_step_feature(
+                        backbone=backbone,
+                        model_type=model_type,
+                        shells=obs["shells"],
+                        state=obs["state"],
+                        temporal_model=temporal_model,
+                        temporal_hidden=temporal_hidden,
+                    )
+                t_infer = time.perf_counter() - t0
+                total_infer_time += t_infer
+
+                # Policy forward pass
+                goal_v = obs["goal_vec"]
+                logits, values = policy(feat, goal_v)
+                action_probs = np.array(jax.nn.softmax(logits[0]))
+                v_est = float(values[0])
+
+                if greedy:
+                    action = int(jnp.argmax(logits[0]))
+                else:
+                    key, subkey = jax.random.split(key)
+                    action = int(jax.random.categorical(subkey, logits[0]))
+
+                next_obs, reward, done, last_info = env.step(action)
+                ep_return += reward
+
+                # Live IPC telemetry stream if enabled
+                if emitter is not None and hasattr(env, "extractor"):
+                    curr_pos = getattr(env, "player_pos", curr_player)
+                    breadcrumbs.append(tuple(curr_pos))
+                    if len(breadcrumbs) > 64:
+                        breadcrumbs.pop(0)
+
+                    d_curr = float(np.linalg.norm(np.array(curr_pos) - np.array(target_tuple)))
+                    world_dx = float(target_tuple[0] - curr_pos[0])
+                    world_dy = float(target_tuple[1] - curr_pos[1])
+                    world_dz = float(target_tuple[2] - curr_pos[2])
+                    bc_rel = [(p[0] - curr_pos[0], p[1] - curr_pos[1], p[2] - curr_pos[2]) for p in breadcrumbs]
+                    bfs_rel = [(p[0] - curr_pos[0], p[1] - curr_pos[1], p[2] - curr_pos[2]) for p in bfs_tuples[:64]]
+
+                    telem_bytes = InferenceTelemetry.pack(
+                        target_pos=(target_tuple[0], target_tuple[1], target_tuple[2]),
+                        world_delta=(world_dx, world_dy, world_dz),
+                        target_dist=d_curr,
+                        step_reward=float(reward),
+                        episode_return=float(ep_return),
+                        critic_value=v_est,
+                        action_probabilities=list(action_probs),
+                        breadcrumbs=bc_rel,
+                        optimal_path=bfs_rel,
+                    )
+                    cardinal_str = getattr(env, "cardinal", "SOUTH")
+                    foot_idx = getattr(env, "foot_index", 6)
+                    raw_view = env.extractor.extract_observation(tuple(curr_pos), cardinal_str, foot_index=foot_idx)
+                    emitter.emit_observation(raw_view, game_tick=step_count, telemetry_bytes=telem_bytes)
+
+                    elapsed = time.perf_counter() - step_t0
+                    if step_delay > elapsed:
+                        time.sleep(step_delay - elapsed)
+
+                obs = next_obs
 
         # Episode Metrics
         success = bool(last_info.get("success", False))
@@ -199,6 +286,9 @@ def evaluate_navigation(
         total_waypoint_list.append(tot_wp)
         hazard_collision_list.append(1.0 if is_hazard else 0.0)
         episode_lengths.append(step_count)
+    finally:
+        if emitter is not None:
+            emitter.close()
 
     # 4. Aggregate Metrics
     n = max(1, actual_episodes)
@@ -273,6 +363,23 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to directory containing custom course .npz files.",
+    )
+    parser.add_argument(
+        "--region_dir",
+        type=str,
+        default=None,
+        help="Path to directory containing baked Minecraft region memmaps (.mmap).",
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Stream live evaluation frames + telemetry into shared memory (squared_sense_mc.bin) for 3D visualizer.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=10.0,
+        help="Streaming FPS when --visualize is enabled (default 10.0, 0 for unthrottled).",
     )
     parser.add_argument(
         "--num_episodes",
@@ -372,6 +479,9 @@ def main(args: Optional[List[str]] = None) -> int:
         model_type=opts.model_type,
         temporal_model=temporal_model,
         courses=courses,
+        region_dir=opts.region_dir,
+        visualize=opts.visualize,
+        fps=opts.fps,
         num_episodes=num_episodes,
         max_steps=max_steps,
         use_gating=opts.use_gating,

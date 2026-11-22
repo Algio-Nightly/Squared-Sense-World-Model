@@ -18,6 +18,11 @@ import math
 import os
 import sys
 import time
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import flax.nnx as nnx
@@ -363,7 +368,7 @@ def train_bc_warmstart(
 # ---------------------------------------------------------------------------
 
 def train_ppo(
-    env: VoxelNavEnv,
+    env: Any,
     backbone: Any,
     policy: ActorCriticHead,
     optimizer: nnx.Optimizer,
@@ -638,6 +643,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to directory containing custom course volumes.",
     )
     parser.add_argument(
+        "--region_dir",
+        type=str,
+        default=None,
+        help="Path to directory containing baked Minecraft region memmaps (.mmap).",
+    )
+    parser.add_argument(
         "--save_dir",
         type=str,
         default="checkpoints/ppo_nav",
@@ -666,12 +677,32 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         default=42,
         help="Random seed.",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "gpu", "cpu"],
+        help="Target acceleration device (auto, gpu, cpu).",
+    )
     return parser.parse_args(args)
 
 
 def main(args: Optional[List[str]] = None) -> int:
     """CLI entrypoint for train_ppo_nav."""
     opts = parse_args(args)
+
+    # Configure GPU memory and platform
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    if opts.device != "auto":
+        jax.config.update("jax_platform_name", opts.device)
+
+    backend = jax.default_backend()
+    devices = jax.devices()
+    print(f"\n=======================================================")
+    print(f"Squared Sense World Model — PPO Policy Trainer")
+    print(f"JAX Backend: {backend.upper()} | Devices: {devices}")
+    print(f"=======================================================\n")
+
     rng = nnx.Rngs(opts.seed)
 
     # 1. Instantiate Perception Backbone
@@ -704,7 +735,11 @@ def main(args: Optional[List[str]] = None) -> int:
         load_checkpoint(opts.temporal_ckpt, temporal_model)
 
     # 2. Instantiate Environment
-    if opts.courses_dir and os.path.isdir(opts.courses_dir):
+    if opts.region_dir and os.path.isdir(opts.region_dir):
+        from env.minecraft_env import MinecraftNavEnv
+        print(f"Instantiating MinecraftNavEnv on real terrain from {opts.region_dir}...")
+        env = MinecraftNavEnv(region_dir=opts.region_dir)
+    elif opts.courses_dir and os.path.isdir(opts.courses_dir):
         from eval.eval_navigation import load_courses_from_dir
         courses = load_courses_from_dir(opts.courses_dir)
         if not courses:

@@ -9,6 +9,7 @@ dependencies = [
     "flax>=0.12.12",
     "jax>=0.12.0.1",
     "matplotlib>=3.11.2",
+    "nbtlib>=2.0.4",
     "scikit-learn>=1.9.1",
 ]
 
