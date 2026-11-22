@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+checkpoints
+data/raw_regions
+data/test_regions
+data/baked_regions
+data/episodes
