@@ -230,3 +230,26 @@ def test_train_spatial_jepa_with_region_dir(tmp_path: Path):
     assert np.isfinite(best_val_loss)
     assert os.path.isfile(os.path.join(save_dir, "best.pkl"))
 
+
+def test_mca_baker_limit_sorting(tmp_path: Path):
+    """Verify that bake_world with limit filters MCA files and prioritizes closest to origin (0, 0)."""
+    from env.mca_baker import bake_world
+
+    raw_dir = tmp_path / "raw_regions"
+    out_dir = tmp_path / "baked_limited"
+    raw_dir.mkdir()
+
+    # Create dummy empty .mca files with coords (5, 5), (0, 0), (1, 0), (-1, -1)
+    # Distances squared: (0,0)->0, (1,0)->1, (-1,-1)->2, (5,5)->50
+    filenames = ["r.5.5.mca", "r.0.0.mca", "r.1.0.mca", "r.-1.-1.mca"]
+    for fn in filenames:
+        (raw_dir / fn).write_bytes(b"\x00" * 4096)  # Minimal 4KB header
+
+    manifest = bake_world(str(raw_dir), str(out_dir), limit=2)
+    # Manifest should only have 2 regions baked, specifically r.0.0 and r.1.0 (closest to 0,0)
+    assert manifest["total_regions"] == 2
+    assert "0,0" in manifest["regions"]
+    assert "1,0" in manifest["regions"]
+    assert "5,5" not in manifest["regions"]
+
+

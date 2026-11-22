@@ -221,20 +221,32 @@ def bake_world(
     world_region_dir: str,
     output_dir: str,
     palette_obj: Optional[BlockPalette] = None,
-    overwrite: bool = False
+    overwrite: bool = False,
+    limit: Optional[int] = None,
 ) -> Dict:
     """
-    Bakes all .mca region files in a world directory into memmap arrays and writes
-    a unified world_manifest.json.
+    Bakes all or limited .mca region files in a world directory into memmap arrays and writes
+    a unified world_manifest.json. Prioritizes regions closest to world origin (0, 0) when limit is set.
     """
     if palette_obj is None:
         palette_obj = get_palette()
 
     os.makedirs(output_dir, exist_ok=True)
     mca_files = glob.glob(os.path.join(world_region_dir, "r.*.*.mca"))
-    mca_files.sort()
 
-    print(f"[MCABaker] Found {len(mca_files)} region files in {world_region_dir}")
+    # Sort regions by Euclidean distance from world center (0, 0) to ensure contiguous terrain
+    def _coord_dist(fpath: str) -> float:
+        c = parse_region_coords(fpath)
+        return float(c[0]**2 + c[1]**2) if c else float("inf")
+
+    mca_files.sort(key=_coord_dist)
+
+    total_found = len(mca_files)
+    if limit is not None and limit > 0 and limit < total_found:
+        print(f"[MCABaker] Found {total_found} region files. Limiting bake to {limit} regions closest to origin (0, 0).")
+        mca_files = mca_files[:limit]
+    else:
+        print(f"[MCABaker] Found {total_found} region files in {world_region_dir}")
     baked_regions: Dict[str, Dict] = {}
     total_start = time.time()
 
@@ -286,6 +298,7 @@ def main():
     parser = argparse.ArgumentParser(description="Bake Minecraft .mca region files into NumPy memmap arrays.")
     parser.add_argument("--input", "--input-dir", "--world_dir", "--world-dir", "-i", dest="input", type=str, required=True, help="Path to .mca file or directory containing .mca files.")
     parser.add_argument("--output", "--output-dir", "--output_dir", "-o", dest="output", type=str, required=True, help="Output directory for baked .mmap and metadata files.")
+    parser.add_argument("--limit", "--max_regions", "-n", dest="limit", type=int, default=None, help="Maximum number of .mca region files to bake (prioritized closest to origin (0, 0)).")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite already baked files.")
 
     args = parser.parse_args()
@@ -294,7 +307,7 @@ def main():
         meta = bake_region(args.input, args.output, overwrite=args.overwrite)
         print(json.dumps(meta, indent=4))
     elif os.path.isdir(args.input):
-        bake_world(args.input, args.output, overwrite=args.overwrite)
+        bake_world(args.input, args.output, overwrite=args.overwrite, limit=args.limit)
     else:
         print(f"Error: Input path {args.input} does not exist.")
 
