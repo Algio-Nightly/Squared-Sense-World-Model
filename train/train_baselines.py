@@ -47,7 +47,13 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--data_dir",
         type=str,
         default=None,
-        help="Path to directory containing dataset (.npy, .npz, or .h5 files).",
+        help="Path to directory containing dataset (.npz files).",
+    )
+    parser.add_argument(
+        "--region_dir",
+        type=str,
+        default=None,
+        help="Path to directory containing baked Minecraft regions (.mmap). If provided and --data_dir is omitted, episodes are loaded or generated directly from baked terrain.",
     )
     parser.add_argument(
         "--save_dir",
@@ -266,7 +272,8 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
         raise ValueError(f"Unknown baseline model: {args.model}")
 
     # 2. Load Data
-    train_x, val_x = load_dataset(args.data_dir, args.smoke_test, args.seed)
+    effective_data_dir = args.data_dir or args.region_dir
+    train_x, val_x = load_dataset(effective_data_dir, args.smoke_test, args.seed)
     num_train = len(train_x)
     num_val = len(val_x)
     steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))

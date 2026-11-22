@@ -15,15 +15,20 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
+from data.dataset import concat_episode_shells, load_episode_splits, load_preallocated_dataset
 from models.transformer import SpatialJEPA, sample_3d_jepa_masks
 from train.checkpoint import load_checkpoint, save_checkpoint
-from train.diagnostics import append_metrics_jsonl, compute_rankme
+from train.diagnostics import ProgressBar, append_metrics_jsonl, compute_rankme
 from train.losses import cosine_ema_momentum, spatial_jepa_loss
 
 
@@ -36,7 +41,13 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--data_dir",
         type=str,
         default=None,
-        help="Path to directory containing dataset (.npy, .npz, or .h5 files).",
+        help="Path to directory containing dataset (.npz files).",
+    )
+    parser.add_argument(
+        "--region_dir",
+        type=str,
+        default=None,
+        help="Path to directory containing baked Minecraft regions (.mmap). If provided and --data_dir is omitted, episodes are loaded or generated directly from baked terrain.",
     )
     parser.add_argument(
         "--save_dir",
@@ -93,6 +104,42 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Random seed for PRNG initialization (default: 42).",
     )
     parser.add_argument(
+        "--as_uint8",
+        action="store_true",
+        default=True,
+        help="Store voxel shells in RAM as uint8 and normalize per batch inside train_step (default: True).",
+    )
+    parser.add_argument(
+        "--no_as_uint8",
+        action="store_false",
+        dest="as_uint8",
+        help="Disable uint8 storage and eagerly normalize to float32 in RAM.",
+    )
+    parser.add_argument(
+        "--drop_last",
+        action="store_true",
+        default=True,
+        help="Enforce static batch sizes during training to prevent recompilation (default: True).",
+    )
+    parser.add_argument(
+        "--no_drop_last",
+        action="store_false",
+        dest="drop_last",
+        help="Allow variable-sized last batch (may cause JIT recompilation).",
+    )
+    parser.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=None,
+        help="Micro-batch size for gradient accumulation to fit within low VRAM devices (default: None).",
+    )
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=5,
+        help="Step interval for mini-logs and progress bar updates (default: 5).",
+    )
+    parser.add_argument(
         "--smoke_test",
         action="store_true",
         help="Run fast smoke test (2 epochs on 16 synthetic random frames, batch_size=4).",
@@ -103,34 +150,23 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         parsed.epochs = 2
         parsed.batch_size = 4
         parsed.warmup_epochs = 1
+        if parsed.log_every == 5:
+            parsed.log_every = 2
 
     return parsed
 
 
 @nnx.jit
-def train_step(
+def micro_train_step(
     model: SpatialJEPA,
-    optimizer: nnx.Optimizer,
     x: jax.Array,
     rng_key: jax.Array,
-    ema_momentum: float,
     alpha: float,
     beta: float,
-) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-    """Single JIT-compiled optimization step for Stage 1A Spatial JEPA.
-
-    Args:
-        model: SpatialJEPA module.
-        optimizer: nnx.Optimizer managing context_encoder and predictor parameters.
-        x: (B, 3, 16, 16, 16, 16) voxel input batch.
-        rng_key: JAX PRNG key for 3D mask sampling.
-        ema_momentum: Scalar momentum for updating target encoder.
-        alpha: VICReg variance loss weight.
-        beta: VICReg covariance loss weight.
-
-    Returns:
-        (loss, metrics_dict) tuple of JAX scalars.
-    """
+) -> Tuple[Tuple[jax.Array, Dict[str, jax.Array]], Any]:
+    """Single JIT-compiled micro-batch forward and backward pass."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     b = x.shape[0]
     vis_idx, tgt_idx = sample_3d_jepa_masks(rng_key, b, num_shells=model.num_shells, cross_scale_prob=0.3)
 
@@ -140,17 +176,81 @@ def train_step(
         return loss, metrics
 
     (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    return (loss, metrics), grads
 
-    # Strictly update ONLY context_encoder and predictor parameters
+
+@nnx.jit
+def apply_accumulated_grads(
+    model: SpatialJEPA,
+    optimizer: nnx.Optimizer,
+    grads: Any,
+    ema_momentum: float,
+) -> None:
+    """Apply accumulated gradients to parameters and update EMA target encoder."""
     optimizer.update(
         (model.context_encoder, model.predictor),
         (grads.context_encoder, grads.predictor),
     )
-
-    # In-place EMA update of target encoder
     model.update_ema(ema_momentum)
 
-    return loss, metrics
+
+def train_step(
+    model: SpatialJEPA,
+    optimizer: nnx.Optimizer,
+    x: jax.Array,
+    rng_key: jax.Array,
+    ema_momentum: float,
+    alpha: float,
+    beta: float,
+    micro_batch_size: Optional[int] = None,
+) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    """Single optimization step for Stage 1A Spatial JEPA with optional gradient accumulation.
+
+    Performs on-device uint8 -> float32 normalization. If micro_batch_size is
+    specified and smaller than batch size, evaluates micro-batches sequentially to
+    minimize peak activation memory inside small VRAM (e.g., 4 GB).
+
+    Args:
+        model: SpatialJEPA module.
+        optimizer: nnx.Optimizer managing context_encoder and predictor parameters.
+        x: (B, 3, 16, 16, 16, 16) voxel input batch (uint8 or float32).
+        rng_key: JAX PRNG key for 3D mask sampling.
+        ema_momentum: Scalar momentum for updating target encoder.
+        alpha: VICReg variance loss weight.
+        beta: VICReg covariance loss weight.
+        micro_batch_size: Optional micro-batch size for gradient accumulation.
+
+    Returns:
+        (loss, metrics_dict) tuple of JAX scalars.
+    """
+    b = x.shape[0]
+    if micro_batch_size is None or micro_batch_size >= b or (b % micro_batch_size != 0):
+        (loss, metrics), grads = micro_train_step(model, x, rng_key, alpha=alpha, beta=beta)
+        apply_accumulated_grads(model, optimizer, grads, ema_momentum)
+        return loss, metrics
+
+    num_micro = b // micro_batch_size
+    keys = jax.random.split(rng_key, num_micro)
+
+    total_loss = 0.0
+    accum_metrics = {}
+    accum_grads = None
+
+    for i in range(num_micro):
+        x_micro = x[i * micro_batch_size : (i + 1) * micro_batch_size]
+        (loss_i, metrics_i), grads_i = micro_train_step(model, x_micro, keys[i], alpha=alpha, beta=beta)
+        total_loss = total_loss + loss_i / num_micro
+
+        for k, v in metrics_i.items():
+            accum_metrics[k] = accum_metrics.get(k, 0.0) + v / num_micro
+
+        if accum_grads is None:
+            accum_grads = jax.tree.map(lambda g: g / num_micro, grads_i)
+        else:
+            accum_grads = jax.tree.map(lambda acc, g: acc + g / num_micro, accum_grads, grads_i)
+
+    apply_accumulated_grads(model, optimizer, accum_grads, ema_momentum)
+    return total_loss, accum_metrics
 
 
 @nnx.jit
@@ -173,6 +273,8 @@ def val_step(
     Returns:
         (loss, metrics_dict) tuple of JAX scalars.
     """
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     b = x.shape[0]
     vis_idx, tgt_idx = sample_3d_jepa_masks(rng_key, b, num_shells=model.num_shells, cross_scale_prob=0.3)
     pred_targets, norm_ema, context_tokens = model(x, vis_idx, tgt_idx)
@@ -195,6 +297,8 @@ def extract_unmasked_embeddings(model: SpatialJEPA, x: jax.Array) -> jax.Array:
     Returns:
         (B, 256) mean-pooled embedding vectors.
     """
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     tokens = model.context_encoder(x, visible_idx=None)  # (B, 192, 256)
     return jnp.mean(tokens, axis=1)  # (B, 256)
 
@@ -203,6 +307,7 @@ def load_dataset(
     data_dir: Optional[str],
     smoke_test: bool,
     seed: int,
+    as_uint8: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Load or synthetically generate train and validation voxel data.
 
@@ -211,35 +316,15 @@ def load_dataset(
     """
     if smoke_test or data_dir is None:
         rng = np.random.default_rng(seed)
-        train_x = rng.uniform(0.0, 1.0, size=(16, 3, 16, 16, 16, 16)).astype(np.float32)
-        val_x = rng.uniform(0.0, 1.0, size=(4, 3, 16, 16, 16, 16)).astype(np.float32)
+        if as_uint8:
+            train_x = rng.integers(0, 256, size=(16, 3, 16, 16, 16, 16), dtype=np.uint8)
+            val_x = rng.integers(0, 256, size=(4, 3, 16, 16, 16, 16), dtype=np.uint8)
+        else:
+            train_x = rng.uniform(0.0, 1.0, size=(16, 3, 16, 16, 16, 16)).astype(np.float32)
+            val_x = rng.uniform(0.0, 1.0, size=(4, 3, 16, 16, 16, 16)).astype(np.float32)
         return train_x, val_x
 
-    if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"Dataset directory '{data_dir}' does not exist.")
-
-    # Search for common numpy formats
-    npy_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npy")]
-    npz_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npz")]
-
-    if npy_files:
-        arrays = [np.load(f, mmap_mode="r") for f in npy_files]
-        all_data = np.concatenate(arrays, axis=0)
-    elif npz_files:
-        data_list = []
-        for f in npz_files:
-            with np.load(f) as archive:
-                key = "voxels" if "voxels" in archive else archive.files[0]
-                data_list.append(archive[key])
-        all_data = np.concatenate(data_list, axis=0)
-    else:
-        raise FileNotFoundError(f"No .npy or .npz voxel dataset files found in '{data_dir}'.")
-
-    # 90% train, 10% validation split
-    split_idx = max(int(0.9 * len(all_data)), 1)
-    train_x = all_data[:split_idx]
-    val_x = all_data[split_idx:] if split_idx < len(all_data) else all_data[:split_idx]
-    return train_x, val_x
+    return load_preallocated_dataset(data_dir, seed=seed, as_uint8=as_uint8)
 
 
 def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
@@ -255,10 +340,16 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
     model = SpatialJEPA(num_shells=3, rngs=nnx.Rngs(int(jax.random.bits(model_key))))
 
     # 2. Load Data
-    train_x, val_x = load_dataset(args.data_dir, args.smoke_test, args.seed)
+    effective_data_dir = args.data_dir or args.region_dir
+    as_uint8 = getattr(args, "as_uint8", True)
+    train_x, val_x = load_dataset(effective_data_dir, args.smoke_test, args.seed, as_uint8=as_uint8)
     num_train = len(train_x)
     num_val = len(val_x)
-    steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
+    drop_last = getattr(args, "drop_last", True)
+    if drop_last and num_train >= args.batch_size:
+        steps_per_epoch = max(1, num_train // args.batch_size)
+    else:
+        steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
 
@@ -280,11 +371,12 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
     best_val_loss = float("inf")
     global_step = 0
 
+    micro_str = f" | Micro-Batch: {args.micro_batch_size}" if getattr(args, "micro_batch_size", None) else ""
     print(
         f"Starting Stage 1A Spatial JEPA Training:\n"
         f"  Epochs: {args.epochs} | Steps/Epoch: {steps_per_epoch} | Total Steps: {total_steps}\n"
-        f"  Batch Size: {args.batch_size} | Peak LR: {args.lr} | Warmup Epochs: {args.warmup_epochs}\n"
-        f"  Train Samples: {num_train} | Val Samples: {num_val}\n"
+        f"  Batch Size: {args.batch_size}{micro_str} | Peak LR: {args.lr} | Warmup Epochs: {args.warmup_epochs}\n"
+        f"  Train Samples: {num_train} | Val Samples: {num_val} | Dtype: {train_x.dtype} | Drop Last: {drop_last}\n"
         f"  Save Dir: {args.save_dir}\n"
     )
 
@@ -299,6 +391,12 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
         train_pred_loss_accum = 0.0
         train_var_loss_accum = 0.0
         train_cov_loss_accum = 0.0
+
+        pbar = ProgressBar(
+            total=steps_per_epoch,
+            prefix=f"Epoch {epoch:02d}/{args.epochs:02d}",
+            log_every=args.log_every,
+        )
 
         for step in range(steps_per_epoch):
             batch_idx = train_indices[step * args.batch_size : (step + 1) * args.batch_size]
@@ -315,6 +413,20 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
                 ema_momentum=ema_m,
                 alpha=args.alpha,
                 beta=args.beta,
+                micro_batch_size=getattr(args, "micro_batch_size", None),
+            )
+
+            step_lr = float(schedule(global_step))
+            pbar.update(
+                step + 1,
+                {
+                    "Loss": loss,
+                    "Pred": metrics["pred_loss"],
+                    "Var": metrics["var_loss"],
+                    "Cov": metrics["cov_loss"],
+                    "EMA": ema_m,
+                    "LR": step_lr,
+                },
             )
 
             train_loss_accum += float(loss)
@@ -327,9 +439,18 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
         avg_train_pred_loss = train_pred_loss_accum / steps_per_epoch
 
         # Validation Loop
-        val_steps = max(1, math.ceil(num_val / args.batch_size))
+        if drop_last and num_val >= args.batch_size:
+            val_steps = num_val // args.batch_size
+        else:
+            val_steps = max(1, math.ceil(num_val / args.batch_size))
         val_loss_accum = 0.0
         val_emb_std_accum = 0.0
+
+        val_pbar = ProgressBar(
+            total=val_steps,
+            prefix=f"Val {epoch:02d}/{args.epochs:02d}",
+            log_every=args.log_every,
+        )
 
         for v_step in range(val_steps):
             v_idx = np.arange(v_step * args.batch_size, min((v_step + 1) * args.batch_size, num_val))
@@ -342,6 +463,13 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
                 rng_key=v_key,
                 alpha=args.alpha,
                 beta=args.beta,
+            )
+            val_pbar.update(
+                v_step + 1,
+                {
+                    "ValLoss": v_loss,
+                    "EmbStd": v_metrics["emb_std"],
+                },
             )
             val_loss_accum += float(v_loss)
             val_emb_std_accum += float(v_metrics["emb_std"])

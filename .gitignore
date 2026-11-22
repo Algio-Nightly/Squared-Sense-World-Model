@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv
+
+.pytest_cache
+
+data/raw_regions
+data/test_regions
+data/baked_regions
+
+checkpoints
+episodes

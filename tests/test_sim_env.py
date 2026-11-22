@@ -30,6 +30,27 @@ def test_cardinal_snapper_hysteresis() -> None:
     assert snapper.snap(29.0) == 0.0
 
 
+def test_cardinal_snapper_default_10deg_deadband() -> None:
+    """Verify CardinalSnapper snaps with standardized ±10° rotational hysteresis deadband by default."""
+    snapper = CardinalSnapper(initial_yaw=0.0)
+    assert snapper.deadband == 10.0
+    assert snapper.snap(0.0) == 0.0
+
+    # Under 55° (45° + 10°), direction remains 0°
+    assert snapper.snap(45.0) == 0.0
+    assert snapper.snap(54.0) == 0.0
+
+    # Departing > 55° switches to 90°
+    assert snapper.snap(56.0) == 90.0
+
+    # Departure from 90° < 55° retains 90°
+    assert snapper.snap(45.0) == 90.0
+    assert snapper.snap(36.0) == 90.0
+
+    # Departing > 55° from 90° (past 35°) switches back to 0°
+    assert snapper.snap(34.0) == 0.0
+
+
 def test_reset_shapes_and_ranges() -> None:
     """Verify reset() returns exact channel-last (3, 16, 16, 16, 16) float32 in [0, 1],
 
@@ -53,8 +74,8 @@ def test_reset_shapes_and_ranges() -> None:
     assert state.shape == (12,)
     assert state.dtype == np.float32
     # Verify health, food, grounded are reasonable
-    assert state[9] == 20.0  # health
-    assert state[10] == 20.0  # food
+    assert state[9] == 1.0  # health normalized to 1.0
+    assert state[10] == 1.0  # food normalized to 1.0
     assert state[11] == 1.0  # standing on ground
 
     # 3. Goal vector
