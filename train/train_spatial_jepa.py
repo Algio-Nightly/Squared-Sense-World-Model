@@ -9,6 +9,7 @@ Strictly follows docs/TRAIN_CONTRACT.md and docs/MODEL_CONTRACT.md.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import math
 import os
 import sys
@@ -330,6 +331,7 @@ def load_dataset(
 def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
     """Run full training loop for Stage 1A Spatial JEPA."""
     os.makedirs(args.save_dir, exist_ok=True)
+    log_path = os.path.join(args.save_dir, "train.log")
     metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     best_ckpt_path = os.path.join(args.save_dir, "best.pkl")
     last_ckpt_path = os.path.join(args.save_dir, "last.pkl")
@@ -396,6 +398,8 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
             total=steps_per_epoch,
             prefix=f"Epoch {epoch:02d}/{args.epochs:02d}",
             log_every=args.log_every,
+            log_file=log_path,
+            process_tag="SpatialJEPA",
         )
 
         for step in range(steps_per_epoch):
@@ -450,6 +454,8 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
             total=val_steps,
             prefix=f"Val {epoch:02d}/{args.epochs:02d}",
             log_every=args.log_every,
+            log_file=log_path,
+            process_tag="SpatialJEPA",
         )
 
         for v_step in range(val_steps):
@@ -534,7 +540,9 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
 
         # Compact console progress line
         rankme_str = f"{rankme_val:6.2f}" if rankme_val is not None else "   N/A"
-        print(
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        epoch_line = (
+            f"[{now_ts}] [SpatialJEPA PID {os.getpid()}] "
             f"Epoch [{epoch:02d}/{args.epochs:02d}] "
             f"Step {global_step:04d} | "
             f"Train Loss: {avg_train_loss:6.4f} | "
@@ -543,6 +551,13 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
             f"RankMe: {rankme_str} | "
             f"EMA: {ema_m:6.4f}"
         )
+        print(epoch_line)
+        if log_path:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(epoch_line + "\n")
+            except Exception:
+                pass
 
     print(f"\nTraining completed! Best Val Loss: {best_val_loss:6.4f}")
     return model, best_val_loss

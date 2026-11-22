@@ -11,11 +11,16 @@ Strictly follows docs/TRAIN_CONTRACT.md and docs/MODEL_CONTRACT.md.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import math
 import os
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 import flax.nnx as nnx
 import jax
@@ -26,7 +31,7 @@ import optax
 from models.baselines import Generative3DMAE, SingleLODJEPA
 from models.transformer import sample_3d_jepa_masks
 from train.checkpoint import load_checkpoint, save_checkpoint
-from train.diagnostics import append_metrics_jsonl, compute_rankme
+from train.diagnostics import ProgressBar, append_metrics_jsonl, compute_rankme
 from train.losses import cosine_ema_momentum, spatial_jepa_loss
 from train.train_spatial_jepa import load_dataset
 
@@ -110,6 +115,36 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Random seed for PRNG initialization (default: 42).",
     )
     parser.add_argument(
+        "--as_uint8",
+        action="store_true",
+        default=True,
+        help="Store voxel shells in RAM as uint8 and normalize per batch inside train_step (default: True).",
+    )
+    parser.add_argument(
+        "--no_as_uint8",
+        action="store_false",
+        dest="as_uint8",
+        help="Disable uint8 storage and eagerly normalize to float32 in RAM.",
+    )
+    parser.add_argument(
+        "--drop_last",
+        action="store_true",
+        default=True,
+        help="Enforce static batch sizes during training to prevent recompilation (default: True).",
+    )
+    parser.add_argument(
+        "--no_drop_last",
+        action="store_false",
+        dest="drop_last",
+        help="Allow variable-sized last batch (may cause JIT recompilation).",
+    )
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=5,
+        help="Step interval for mini-logs and progress bar updates (default: 5).",
+    )
+    parser.add_argument(
         "--smoke_test",
         action="store_true",
         help="Run fast smoke test (2 epochs on 16 synthetic random frames, batch_size=4).",
@@ -123,6 +158,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         parsed.epochs = 2
         parsed.batch_size = 4
         parsed.warmup_epochs = 1
+        if parsed.log_every == 5:
+            parsed.log_every = 2
 
     return parsed
 
@@ -143,6 +180,8 @@ def train_step_single_lod(
     beta: float = 0.04,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
     """Single optimization step for SingleLODJEPA baseline."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     b = x.shape[0]
     vis_idx, tgt_idx = sample_3d_jepa_masks(rng_key, b, num_shells=1)
 
@@ -172,6 +211,8 @@ def val_step_single_lod(
     beta: float = 0.04,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
     """Evaluation step for SingleLODJEPA baseline."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     b = x.shape[0]
     vis_idx, tgt_idx = sample_3d_jepa_masks(rng_key, b, num_shells=1)
     pred_targets, norm_ema, context_tokens = model(x, vis_idx, tgt_idx)
@@ -184,6 +225,8 @@ def val_step_single_lod(
 @nnx.jit
 def extract_single_lod_embeddings(model: SingleLODJEPA, x: jax.Array) -> jax.Array:
     """Extract unmasked context representations pooled across single LOD tokens."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     if x.ndim == 6:
         x_single = x[:, model.lod_index : model.lod_index + 1]
     elif x.ndim == 5:
@@ -207,6 +250,8 @@ def train_step_mae(
     rng_key: jax.Array,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
     """Single optimization step for Generative3DMAE baseline."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     b = x.shape[0]
     vis_idx, tgt_idx = sample_3d_jepa_masks(rng_key, b, num_shells=3, cross_scale_prob=0.3)
 
@@ -227,6 +272,8 @@ def val_step_mae(
     rng_key: jax.Array,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
     """Evaluation step for Generative3DMAE baseline."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     b = x.shape[0]
     vis_idx, tgt_idx = sample_3d_jepa_masks(rng_key, b, num_shells=3, cross_scale_prob=0.3)
     _, _, mse_loss = model(x, vis_idx, tgt_idx)
@@ -237,6 +284,8 @@ def val_step_mae(
 @nnx.jit
 def extract_mae_embeddings(model: Generative3DMAE, x: jax.Array) -> jax.Array:
     """Extract unmasked representations from MAE encoder pooled across tokens."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
     tokens = model.encoder(x, visible_idx=None)  # (B, 192, 256)
     return jnp.mean(tokens, axis=1)  # (B, 256)
 
@@ -249,6 +298,7 @@ def extract_mae_embeddings(model: Generative3DMAE, x: jax.Array) -> jax.Array:
 def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Generative3DMAE], float]:
     """Execute end-to-end training pipeline for the selected baseline model."""
     os.makedirs(args.save_dir, exist_ok=True)
+    log_path = os.path.join(args.save_dir, "train.log")
     metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     best_ckpt_path = os.path.join(args.save_dir, "best.pkl")
     last_ckpt_path = os.path.join(args.save_dir, "last.pkl")
@@ -273,10 +323,15 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
 
     # 2. Load Data
     effective_data_dir = args.data_dir or args.region_dir
-    train_x, val_x = load_dataset(effective_data_dir, args.smoke_test, args.seed)
+    as_uint8 = getattr(args, "as_uint8", True)
+    train_x, val_x = load_dataset(effective_data_dir, args.smoke_test, args.seed, as_uint8=as_uint8)
     num_train = len(train_x)
     num_val = len(val_x)
-    steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
+    drop_last = getattr(args, "drop_last", True)
+    if drop_last and num_train >= args.batch_size:
+        steps_per_epoch = max(1, num_train // args.batch_size)
+    else:
+        steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
 
@@ -306,7 +361,7 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
         f"Starting Baseline Training [{args.model}]:\n"
         f"  Epochs: {args.epochs} | Steps/Epoch: {steps_per_epoch} | Total Steps: {total_steps}\n"
         f"  Batch Size: {args.batch_size} | Peak LR: {args.lr} | Warmup Epochs: {args.warmup_epochs}\n"
-        f"  Train Samples: {num_train} | Val Samples: {num_val}\n"
+        f"  Train Samples: {num_train} | Val Samples: {num_val} | Dtype: {train_x.dtype} | Drop Last: {drop_last}\n"
         f"  Save Dir: {args.save_dir}\n",
         flush=True,
     )
@@ -317,6 +372,14 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
         train_indices = epoch_rng.permutation(num_train)
 
         train_loss_accum = 0.0
+
+        pbar = ProgressBar(
+            total=steps_per_epoch,
+            prefix=f"Epoch {epoch:02d}/{args.epochs:02d}",
+            log_every=args.log_every,
+            log_file=log_path,
+            process_tag=f"Baseline_{args.model}",
+        )
 
         for step in range(steps_per_epoch):
             batch_idx = train_indices[step * args.batch_size : (step + 1) * args.batch_size]
@@ -344,14 +407,36 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
                     beta=args.beta,
                 )
 
+            step_lr = float(schedule(global_step))
+            pbar_dict = {"Loss": loss, "LR": step_lr}
+            if not is_mae:
+                pbar_dict["Pred"] = metrics.get("pred_loss", 0.0)
+                pbar_dict["Var"] = metrics.get("var_loss", 0.0)
+                pbar_dict["Cov"] = metrics.get("cov_loss", 0.0)
+                pbar_dict["EMA"] = ema_m
+            else:
+                pbar_dict["MSE"] = metrics.get("mse_loss", loss)
+            pbar.update(step + 1, pbar_dict)
+
             train_loss_accum += float(loss)
             global_step += 1
 
         avg_train_loss = train_loss_accum / steps_per_epoch
 
         # Validation Loop
-        val_steps = max(1, math.ceil(num_val / args.batch_size))
+        if drop_last and num_val >= args.batch_size:
+            val_steps = num_val // args.batch_size
+        else:
+            val_steps = max(1, math.ceil(num_val / args.batch_size))
         val_loss_accum = 0.0
+
+        val_pbar = ProgressBar(
+            total=val_steps,
+            prefix=f"Val {epoch:02d}/{args.epochs:02d}",
+            log_every=args.log_every,
+            log_file=log_path,
+            process_tag=f"Baseline_{args.model}",
+        )
 
         for v_step in range(val_steps):
             v_idx = np.arange(v_step * args.batch_size, min((v_step + 1) * args.batch_size, num_val))
@@ -360,10 +445,12 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
 
             if is_mae:
                 assert isinstance(model, Generative3DMAE)
-                v_loss, _ = val_step_mae(model, v_batch, v_key)
+                v_loss, v_metrics = val_step_mae(model, v_batch, v_key)
+                val_pbar.update(v_step + 1, {"ValLoss": v_loss, "MSE": v_metrics.get("mse_loss", v_loss)})
             else:
                 assert isinstance(model, SingleLODJEPA)
-                v_loss, _ = val_step_single_lod(model, v_batch, v_key, alpha=args.alpha, beta=args.beta)
+                v_loss, v_metrics = val_step_single_lod(model, v_batch, v_key, alpha=args.alpha, beta=args.beta)
+                val_pbar.update(v_step + 1, {"ValLoss": v_loss, "EmbStd": v_metrics.get("emb_std", 0.0)})
 
             val_loss_accum += float(v_loss)
 
@@ -431,14 +518,22 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
         append_metrics_jsonl(metrics_path, record)
 
         rankme_str = f"{rankme_val:6.2f}" if rankme_val is not None else "   N/A"
-        print(
-            f"[{args.model}] Epoch [{epoch:02d}/{args.epochs:02d}] "
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        epoch_line = (
+            f"[{now_ts}] [Baseline_{args.model} PID {os.getpid()}] "
+            f"Epoch [{epoch:02d}/{args.epochs:02d}] "
             f"Step {global_step:04d} | "
             f"Train Loss: {avg_train_loss:6.4f} | "
             f"Val Loss: {avg_val_loss:6.4f} | "
-            f"RankMe: {rankme_str}",
-            flush=True,
+            f"RankMe: {rankme_str}"
         )
+        print(epoch_line)
+        if log_path:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(epoch_line + "\n")
+            except Exception:
+                pass
 
     print(f"\nBaseline [{args.model}] Training Completed! Best Val Loss: {best_val_loss:6.4f}", flush=True)
     return model, best_val_loss
