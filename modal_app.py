@@ -173,7 +173,7 @@ def train_spatial(
     beta: float = 0.04,
     data_dir: str = f"{REMOTE_VOL_PATH}/data",
     save_dir: str = f"{REMOTE_VOL_PATH}/checkpoints/m2_spatial_jepa",
-    log_every: int = 5,
+    log_every: int = 25,
     smoke_test: bool = False,
 ) -> str:
     """Train MultiLODBackbone + JEPAPredictor via 3D spatial masking and EMA target."""
@@ -232,7 +232,7 @@ def train_baselines(
     lr: float = 3e-4,
     data_dir: str = f"{REMOTE_VOL_PATH}/data",
     save_dir_prefix: str = f"{REMOTE_VOL_PATH}/checkpoints/baselines",
-    log_every: int = 5,
+    log_every: int = 25,
     smoke_test: bool = False,
 ) -> List[str]:
     """Train parameter-matched baseline models: B1 (LOD-0), B2 (LOD-2), B3 (3D-MAE)."""
@@ -297,7 +297,7 @@ def train_temporal(
     k_steps: int = 4,
     lr: float = 3e-4,
     omega: float = 0.2,
-    log_every: int = 5,
+    log_every: int = 25,
     smoke_test: bool = False,
 ) -> str:
     """Train Dual-LSTM Temporal Integrator (Phase 1 frozen spatial, Phase 2 anchored fine-tuning)."""
@@ -628,15 +628,16 @@ def main(
     epochs: int = 80,
     batch_size: int = 32,
     model: str = "all",
+    log_every: int = 25,
     smoke_test: bool = False,
 ):
     """Local CLI driver for Modal executions.
 
     Usage Examples:
       uv run modal run modal_app.py --action verify
-      uv run modal run modal_app.py --action train-spatial --epochs 80
-      uv run modal run modal_app.py --action train-baselines --model all
-      uv run modal run modal_app.py --action train-temporal
+      uv run modal run modal_app.py --action train-spatial --epochs 80 --log-every 25
+      uv run modal run modal_app.py --action train-baselines --model all --log-every 25
+      uv run modal run modal_app.py --action train-temporal --log-every 25
       uv run modal run modal_app.py --action eval-probes
       uv run modal run modal_app.py --action train-ppo
       uv run modal run modal_app.py --action eval-nav
@@ -647,11 +648,11 @@ def main(
     if act in ("verify", "check", "gpu"):
         verify_gpu.remote()
     elif act in ("train-spatial", "spatial", "m2"):
-        train_spatial.remote(epochs=epochs, batch_size=batch_size, smoke_test=smoke_test)
+        train_spatial.remote(epochs=epochs, batch_size=batch_size, log_every=log_every, smoke_test=smoke_test)
     elif act in ("train-baselines", "baselines"):
-        train_baselines.remote(model=model, epochs=epochs, batch_size=batch_size, smoke_test=smoke_test)
+        train_baselines.remote(model=model, epochs=epochs, batch_size=batch_size, log_every=log_every, smoke_test=smoke_test)
     elif act in ("train-temporal", "temporal", "m1"):
-        train_temporal.remote(batch_size=batch_size, smoke_test=smoke_test)
+        train_temporal.remote(batch_size=batch_size, log_every=log_every, smoke_test=smoke_test)
     elif act in ("eval-probes", "probes", "eval"):
         run_eval.remote(smoke_test=smoke_test)
     elif act in ("train-ppo", "ppo"):

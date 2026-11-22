@@ -137,8 +137,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--log_every",
         type=int,
-        default=5,
-        help="Step interval for mini-logs and progress bar updates (default: 5).",
+        default=25,
+        help="Step interval for mini-logs and progress bar updates (default: 25).",
     )
     parser.add_argument(
         "--smoke_test",
