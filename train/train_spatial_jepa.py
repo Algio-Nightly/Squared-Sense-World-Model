@@ -20,6 +20,11 @@ repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
+from train.gpu_env import auto_configure_batching, setup_gpu_environment
+
+# Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
+setup_gpu_environment()
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -336,6 +341,14 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
     best_ckpt_path = os.path.join(args.save_dir, "best.pkl")
     last_ckpt_path = os.path.join(args.save_dir, "last.pkl")
 
+    backend = jax.default_backend()
+    devices = jax.devices()
+    args.batch_size, args.micro_batch_size = auto_configure_batching(
+        batch_size=args.batch_size,
+        micro_batch_size=getattr(args, "micro_batch_size", None),
+        backend=backend,
+    )
+
     # 1. Initialize PRNG and Model
     root_key = jax.random.key(args.seed)
     model_key, train_key = jax.random.split(root_key)
@@ -353,14 +366,15 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
     else:
         steps_per_epoch = max(1, math.ceil(num_train / args.batch_size))
     total_steps = args.epochs * steps_per_epoch
-    warmup_steps = args.warmup_epochs * steps_per_epoch
+    warmup_steps = min(args.warmup_epochs * steps_per_epoch, max(0, total_steps - 1))
+    decay_steps = max(total_steps, warmup_steps + 1)
 
     # 3. Configure Optimizer and Schedule
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=args.lr,
         warmup_steps=warmup_steps,
-        decay_steps=total_steps,
+        decay_steps=decay_steps,
         end_value=args.lr * 0.01,
     )
     tx = optax.chain(
@@ -433,14 +447,14 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
                 },
             )
 
-            train_loss_accum += float(loss)
-            train_pred_loss_accum += float(metrics["pred_loss"])
-            train_var_loss_accum += float(metrics["var_loss"])
-            train_cov_loss_accum += float(metrics["cov_loss"])
+            train_loss_accum = train_loss_accum + loss
+            train_pred_loss_accum = train_pred_loss_accum + metrics["pred_loss"]
+            train_var_loss_accum = train_var_loss_accum + metrics["var_loss"]
+            train_cov_loss_accum = train_cov_loss_accum + metrics["cov_loss"]
             global_step += 1
 
-        avg_train_loss = train_loss_accum / steps_per_epoch
-        avg_train_pred_loss = train_pred_loss_accum / steps_per_epoch
+        avg_train_loss = float(train_loss_accum) / steps_per_epoch
+        avg_train_pred_loss = float(train_pred_loss_accum) / steps_per_epoch
 
         # Validation Loop
         if drop_last and num_val >= args.batch_size:
@@ -477,11 +491,11 @@ def train_spatial_jepa(args: argparse.Namespace) -> Tuple[SpatialJEPA, float]:
                     "EmbStd": v_metrics["emb_std"],
                 },
             )
-            val_loss_accum += float(v_loss)
-            val_emb_std_accum += float(v_metrics["emb_std"])
+            val_loss_accum = val_loss_accum + v_loss
+            val_emb_std_accum = val_emb_std_accum + v_metrics["emb_std"]
 
-        avg_val_loss = val_loss_accum / val_steps
-        avg_emb_std = val_emb_std_accum / val_steps
+        avg_val_loss = float(val_loss_accum) / val_steps
+        avg_emb_std = float(val_emb_std_accum) / val_steps
 
         # Compute uncentered RankMe every 5 epochs and on the final epoch
         rankme_val: Optional[float] = None

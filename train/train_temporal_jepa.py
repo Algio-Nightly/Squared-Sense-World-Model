@@ -24,6 +24,15 @@ repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
+from train.gpu_env import auto_configure_batching, setup_gpu_environment
+
+# Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
+setup_gpu_environment()
+
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -488,6 +497,18 @@ def train_temporal_jepa(args: argparse.Namespace) -> Tuple[DualLSTMTemporalInteg
     metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     temp_best_ckpt = os.path.join(args.save_dir, "temporal_best.pkl")
     spat_best_ckpt = os.path.join(args.save_dir, "spatial_finetuned_best.pkl")
+
+    backend = jax.default_backend()
+    if backend == "gpu":
+        from train.gpu_env import query_gpu_vram
+        vram = query_gpu_vram()
+        if vram and (vram["total_mb"] <= 4600 or vram["free_mb"] < 3000):
+            if args.batch_size > 4 and not args.smoke_test:
+                print(
+                    f"[VRAM Auto-Config] Detected {vram['total_mb']} MiB GPU ({vram['free_mb']} MiB free). "
+                    f"Adjusting temporal batch_size from {args.batch_size} to 4 for sequence memory safety."
+                )
+                args.batch_size = 4
 
     root_key = jax.random.key(args.seed)
     k_spat, k_temp, train_key = jax.random.split(root_key, 3)

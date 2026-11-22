@@ -17,6 +17,15 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+from train.gpu_env import setup_gpu_environment
+
+# Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
+setup_gpu_environment()
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
