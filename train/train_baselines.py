@@ -17,6 +17,15 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+from train.gpu_env import auto_configure_batching, setup_gpu_environment
+
+# Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
+setup_gpu_environment()
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -108,6 +117,12 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=42,
         help="Random seed for PRNG initialization (default: 42).",
+    )
+    parser.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=None,
+        help="Micro-batch size for gradient accumulation to fit within low VRAM devices (default: None).",
     )
     parser.add_argument(
         "--smoke_test",
@@ -252,6 +267,13 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
     metrics_path = os.path.join(args.save_dir, "metrics.jsonl")
     best_ckpt_path = os.path.join(args.save_dir, "best.pkl")
     last_ckpt_path = os.path.join(args.save_dir, "last.pkl")
+
+    backend = jax.default_backend()
+    args.batch_size, args.micro_batch_size = auto_configure_batching(
+        batch_size=args.batch_size,
+        micro_batch_size=getattr(args, "micro_batch_size", None),
+        backend=backend,
+    )
 
     root_key = jax.random.key(args.seed)
     model_key, train_key = jax.random.split(root_key)

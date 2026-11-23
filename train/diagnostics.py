@@ -49,6 +49,10 @@ class ProgressBar:
 
     def update(self, current: int, metrics: Optional[Dict[str, Any]] = None):
         """Update progress bar display with current step and metrics dict."""
+        is_periodic = (current % self.log_every == 0) or (current == self.total)
+        if not is_periodic and not self.is_tty:
+            return
+
         now = time.time()
         elapsed = now - self.start_time
         rate = elapsed / max(current, 1)
@@ -59,7 +63,7 @@ class ProgressBar:
         elap_str = self._format_time(elapsed)
 
         metric_parts = []
-        if metrics:
+        if metrics and is_periodic:
             for k, v in metrics.items():
                 if isinstance(v, (float, np.floating, jax.Array)):
                     val = float(v)
