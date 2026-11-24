@@ -26,12 +26,20 @@ from train.gpu_env import setup_gpu_environment
 # Ensure non-greedy allocation and VRAM limits are set prior to XLA initialization
 setup_gpu_environment()
 
+# Prevent joblib/sklearn multiprocessing from calling os.fork() after JAX initialization
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.metrics import f1_score, r2_score, roc_auc_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from data.dataset import (
     compute_local_hazard_labels,
@@ -72,22 +80,34 @@ def _rollout_temporal(
 
 
 @nnx.jit
+def _step_single(
+    temporal_model: DualLSTMTemporalIntegrator,
+    tok_t: jax.Array,
+    st_t: jax.Array,
+    act_t: jax.Array,
+    hidden: Any,
+) -> Tuple[jax.Array, Any]:
+    """Single JIT-compiled step on GPU (compiles in 0.1s without loop unrolling)."""
+    _, c_t, next_hidden = temporal_model.step(tok_t, st_t, act_t, hidden)
+    return jax.lax.stop_gradient(c_t), next_hidden
+
+
 def _step_context_states(
     temporal_model: DualLSTMTemporalIntegrator,
     tokens_seq: jax.Array,
     state_seq: jax.Array,
     action_seq: jax.Array,
 ) -> jax.Array:
-    """Extract fused context representations c_t across trajectory steps."""
+    """Extract fused context representations c_t across trajectory steps without loop unrolling."""
     b, T = tokens_seq.shape[:2]
     hidden = temporal_model.init_hidden(b)
     c_list = []
     for t in range(T):
-        _, c_t, hidden = temporal_model.step(
-            tokens_seq[:, t], state_seq[:, t], action_seq[:, t], hidden
+        c_t, hidden = _step_single(
+            temporal_model, tokens_seq[:, t], state_seq[:, t], action_seq[:, t], hidden
         )
         c_list.append(c_t)
-    return jax.lax.stop_gradient(jnp.stack(c_list, axis=1))
+    return jnp.stack(c_list, axis=1)
 
 
 def extract_features(
@@ -98,6 +118,7 @@ def extract_features(
     action: Optional[np.ndarray | jax.Array] = None,
     temporal_model: Optional[DualLSTMTemporalIntegrator] = None,
     batch_size: int = 32,
+    episode_lengths: Optional[List[int]] = None,
 ) -> np.ndarray:
     """Extract frozen inference embeddings for a given model architecture.
 
@@ -177,13 +198,25 @@ def extract_features(
     st = jnp.zeros((n_samples, 12), dtype=jnp.float32) if state is None else jnp.asarray(state, dtype=jnp.float32)
     act = jnp.zeros((n_samples,), dtype=jnp.int32) if action is None else jnp.asarray(action, dtype=jnp.int32)
 
-    # Treat as sequence: (1, N, ...)
-    tok_seq = all_tokens[None, ...]
-    st_seq = st[None, ...]
-    act_seq = act[None, ...]
+    if episode_lengths is not None and sum(episode_lengths) == n_samples:
+        c_chunks = []
+        offset = 0
+        for ep_len in episode_lengths:
+            tok_ep = all_tokens[offset : offset + ep_len][None, ...]
+            st_ep = st[offset : offset + ep_len][None, ...]
+            act_ep = act[offset : offset + ep_len][None, ...]
+            c_ep = _step_context_states(temporal_model, tok_ep, st_ep, act_ep)
+            c_chunks.append(np.asarray(c_ep[0], dtype=np.float32))
+            offset += ep_len
+        c_all = np.concatenate(c_chunks, axis=0)
+    else:
+        # Treat as sequence: (1, N, ...)
+        tok_seq = all_tokens[None, ...]
+        st_seq = st[None, ...]
+        act_seq = act[None, ...]
 
-    c_seq = _step_context_states(temporal_model, tok_seq, st_seq, act_seq)  # (1, N, 192)
-    c_all = np.asarray(c_seq[0], dtype=np.float32)  # (N, 192)
+        c_seq = _step_context_states(temporal_model, tok_seq, st_seq, act_seq)  # (1, N, 192)
+        c_all = np.asarray(c_seq[0], dtype=np.float32)  # (N, 192)
 
     feat = np.concatenate([z_all, c_all], axis=-1)  # (N, 448)
     return feat.astype(np.float32)
@@ -219,7 +252,7 @@ def probe_distant_goal(
     cos_list = []
 
     for seed in seeds:
-        reg = Ridge(alpha=1.0, random_state=seed)
+        reg = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 7)))
         reg.fit(X_train, y_train)
         y_pred = reg.predict(X_test)
 
@@ -286,8 +319,11 @@ def probe_local_hazard(
         }
 
     for seed in seeds:
-        clf = LogisticRegression(
-            max_iter=500, class_weight="balanced", random_state=seed
+        clf = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(
+                max_iter=1000, class_weight="balanced", random_state=seed
+            ),
         )
         clf.fit(X_train, y_train)
         pred = clf.predict(X_test)
@@ -341,7 +377,7 @@ def probe_kinematic_and_occlusion(
 
     for seed in seeds:
         # 1. Velocity regression
-        reg = Ridge(alpha=1.0, random_state=seed)
+        reg = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 7)))
         reg.fit(X_train, v_train)
         v_pred = reg.predict(X_test)
         v_r2 = float(r2_score(v_test, v_pred))
@@ -352,8 +388,11 @@ def probe_kinematic_and_occlusion(
             pred_occ = np.full_like(occ_test, occ_train_classes[0])
             occ_f1 = float(f1_score(occ_test, pred_occ, zero_division=0.0))
         else:
-            clf = LogisticRegression(
-                max_iter=500, class_weight="balanced", random_state=seed
+            clf = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(
+                    max_iter=1000, class_weight="balanced", random_state=seed
+                ),
             )
             clf.fit(X_train, occ_train)
             pred_occ = clf.predict(X_test)
@@ -598,6 +637,7 @@ def run_probe_suite(
             action=action,
             temporal_model=temporal_model,
             batch_size=32,
+            episode_lengths=[clip_len] * num_episodes,
         )
 
         # Train/test split by episode ID (NEVER frame shuffle)
@@ -674,6 +714,7 @@ def run_probe_suite(
             action=train_ac,
             temporal_model=temporal_model,
             batch_size=32,
+            episode_lengths=[len(ep["shells"]) for ep in train_eps],
         )
         X_test = extract_features(
             model=model,
@@ -683,6 +724,7 @@ def run_probe_suite(
             action=test_ac,
             temporal_model=temporal_model,
             batch_size=32,
+            episode_lengths=[len(ep["shells"]) for ep in test_eps],
         )
 
         y_train_goal, y_test_goal = train_me[:, 3:6], test_me[:, 3:6]

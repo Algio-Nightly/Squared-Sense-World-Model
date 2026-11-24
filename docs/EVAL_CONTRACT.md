@@ -7,12 +7,12 @@
     context `c_t (B, 192)` -> `feat (B, 448)` (or `c_t (B, 192)` alone for pure-memory probes).
 
 ## 2. Option B Frozen Probe Suite (`eval/probe_suite.py`, CPU-friendly scikit-learn)
-Run across 3 random seeds (report mean ± std):
-1. Distant Goal Direction & Distance (30-48 blocks): Ridge / 2L-MLP regression on `meta[:, 3:6]` (R² & Cosine Sim).
-2. 1-Block Local Hazard Detection: LogisticRegression binary classification (F1 & AUROC) for lava/drop within 4 blocks ahead.
+Run across 3 random seeds (report mean ± std) with `StandardScaler` fit strictly on `X_train` and per-episode Dual-LSTM hidden state resets:
+1. Distant Goal Direction & Distance (30-48 blocks): `RidgeCV` regression on `meta[:, 3:6]` (R² & Cosine Sim).
+2. 1-Block Local Hazard Detection: `LogisticRegression(class_weight="balanced")` binary classification (F1 & AUROC) for lava/drop within 4 blocks ahead.
 3. Kinematic Velocity & Occlusion Memory (TI-JEPA Kill Test):
-   - Velocity R² regressing `state[:, 0:3]` (`vx, vy, vz`).
-   - Occlusion recall F1/AUROC predicting whether a hazard was visible 5 steps earlier after a turn.
+   - Velocity R² (`RidgeCV`) regressing `state[:, 0:3]` (`vx, vy, vz`).
+   - Occlusion recall F1 (`LogisticRegression(class_weight="balanced")`) predicting whether a hazard was visible 5 steps earlier after a turn.
 4. Representation Health & Multi-Step Rollout: Uncentered RankMe + k-step (k=1,2,4,8) latent cosine similarity & L1 error.
 
 ## 3. Option A 3D Voxel Navigation Simulator (`eval/sim_env.py`)
@@ -35,9 +35,9 @@ Run across 3 random seeds (report mean ± std):
 - Backbone (`SpatialJEPA` / `SingleLODJEPA` / `Generative3DMAE` + optional `DualLSTM`) is 100% FROZEN (`stop_gradient`).
 - Actor-Critic MLP (~50K params): input `[frozen_feat, goal_dir_3d]` -> `Linear(in, 128) -> GELU -> Linear(128, 128) -> GELU`
   -> Actor head `Linear(128, 12)` + Critic head `Linear(128, 1)`.
-- Supports optional Behavioral Cloning (BC) warm-start from A* demos before PPO fine-tuning.
+- Supports optional Behavioral Cloning (BC) warm-start from A* demos before PPO fine-tuning, as well as `--init_policy` fine-tuning for **RL2** (`--task rl2`, 5 chained targets, `max_steps=600`, `--compass_occlusion 0.5` in 6-tick bursts, continuous `temporal_hidden` across targets).
 - Zero-Shot Evaluation Metrics (`eval/eval_navigation.py`):
-  Success Rate (SR %), SPL, Waypoint Completion %, Hazard Collision Rate %, Empirical MFLOPs & Latency (ms).
+  Success Rate (SR % / Full5%), SPL, Waypoint Completion %, `mean_targets_reached`, Hazard Collision Rate %, Empirical MFLOPs & Latency (ms).
 
 ## 5. Publication Figures (`paper_figs/make_figures.py`, Springer LNEE Compliance)
 - Output format: Vector `.pdf` (and 600 DPI `.png` preview).

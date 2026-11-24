@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from eval.sim_env import VoxelNavEnv, make_debug_bridge_course
-from eval.train_ppo_nav import ActorCriticHead, extract_step_feature
+from eval.train_ppo_nav import ActorCriticHead, _forward_temporal_step, extract_step_feature
 from env.ipc_emitter import MinecraftIpcEmitter
 from env.ipc_telemetry import InferenceTelemetry
 from env.minecraft_env import MinecraftNavEnv
@@ -40,6 +40,7 @@ from models.gating import DENSE_MFLOPS_PER_STEP, EventDrivenShellGate
 from models.temporal_lstm import DualLSTMTemporalIntegrator
 from models.transformer import MultiLODBackbone, SpatialJEPA
 from train.checkpoint import load_checkpoint
+from train.diagnostics import ProgressBar
 
 
 def load_courses_from_dir(
@@ -86,6 +87,9 @@ def evaluate_navigation(
     fps: float = 10.0,
     num_episodes: int = 5,
     max_steps: int = 250,
+    num_targets: int = 1,
+    compass_occlusion_prob: float = 0.0,
+    occlusion_burst_len: int = 6,
     use_gating: bool = False,
     tau_gate: float = 0.05,
     greedy: bool = True,
@@ -121,7 +125,13 @@ def evaluate_navigation(
     use_real_world = bool(region_dir and os.path.exists(region_dir))
     real_env: Optional[MinecraftNavEnv] = None
     if use_real_world:
-        real_env = MinecraftNavEnv(region_dir=region_dir, max_steps=max_steps)
+        real_env = MinecraftNavEnv(
+            region_dir=region_dir,
+            max_steps=max_steps,
+            num_targets=num_targets,
+            compass_occlusion_prob=compass_occlusion_prob,
+            occlusion_burst_len=occlusion_burst_len,
+        )
         actual_episodes = num_episodes
     else:
         if not courses:
@@ -154,14 +164,23 @@ def evaluate_navigation(
         else:
             gate = None
 
+    pb = ProgressBar(
+        total=actual_episodes,
+        prefix="Eval Courses",
+        bar_len=20,
+        log_every=1,
+        log_file="eval_results.log",
+        process_tag="Nav Eval",
+    )
+
     try:
         # 3. Evaluation Loop
         for ep_idx in range(actual_episodes):
             if use_real_world and real_env is not None:
                 env = real_env
-                obs = env.reset()
+                obs = env.reset(seed=seed + ep_idx)
                 l_ref = float(getattr(env, "shortest_path_len", 10.0))
-                waypoints = [tuple(getattr(env, "target_pos", (0, 0, 0)))]
+                waypoints = [tuple(t) for t in getattr(env, "targets", [getattr(env, "target_pos", (0, 0, 0))])]
                 curr_player = getattr(env, "player_pos", np.array([0, 64, 0]))
                 target_tuple = tuple(getattr(env, "target_pos", (0, 64, 10)))
                 optimal_path = getattr(env, "optimal_path", [])
@@ -200,7 +219,7 @@ def evaluate_navigation(
                             temporal_hidden = temporal_model.init_hidden(1)
                         s_arr = jnp.asarray(obs["state"], dtype=jnp.float32).reshape((1, 12))
                         a_arr = jnp.zeros((1,), dtype=jnp.int32)
-                        _, c_t, temporal_hidden = temporal_model.step(tokens, s_arr, a_arr, temporal_hidden)
+                        c_t, temporal_hidden = _forward_temporal_step(temporal_model, tokens, s_arr, a_arr, temporal_hidden)
                         feat = jnp.concatenate([feat, c_t], axis=-1)
                 else:
                     feat, temporal_hidden = extract_step_feature(
@@ -265,27 +284,37 @@ def evaluate_navigation(
 
                 obs = next_obs
 
-        # Episode Metrics
-        success = bool(last_info.get("success", False))
-        path_len = float(last_info.get("path_length", 0.0))
-        wp_reached = int(last_info.get("waypoints_reached", 0))
-        tot_wp = int(last_info.get("total_waypoints", len(waypoints)))
-        is_collision = bool(last_info.get("collision", False))
-        # Hazard collision means catastrophic termination due to lava or fall >= 3
-        is_hazard = is_collision and not success and done
+            # Episode Metrics
+            success = bool(last_info.get("success", False))
+            path_len = float(last_info.get("path_length", 0.0))
+            wp_reached = int(last_info.get("waypoints_reached", 0))
+            tot_wp = int(last_info.get("total_waypoints", len(waypoints)))
+            is_collision = bool(last_info.get("collision", False))
+            # Hazard collision means catastrophic termination due to lava or fall >= 3
+            is_hazard = is_collision and not success and done
 
-        # SPL calculation: S_i * (l_i / max(p_i, l_i))
-        if success:
-            spl_i = float(l_ref / max(path_len, l_ref))
-        else:
-            spl_i = 0.0
+            # SPL calculation: S_i * (l_i / max(path_len, l_i))
+            if success:
+                spl_i = float(l_ref / max(path_len, l_ref))
+            else:
+                spl_i = 0.0
 
-        success_list.append(1.0 if success else 0.0)
-        spl_list.append(spl_i)
-        waypoint_reached_list.append(wp_reached)
-        total_waypoint_list.append(tot_wp)
-        hazard_collision_list.append(1.0 if is_hazard else 0.0)
-        episode_lengths.append(step_count)
+            success_list.append(1.0 if success else 0.0)
+            spl_list.append(spl_i)
+            waypoint_reached_list.append(wp_reached)
+            total_waypoint_list.append(tot_wp)
+            hazard_collision_list.append(1.0 if is_hazard else 0.0)
+            episode_lengths.append(step_count)
+
+            pb.update(
+                ep_idx + 1,
+                metrics={
+                    "SR%": (sum(success_list) / len(success_list)) * 100.0,
+                    "SPL": float(np.mean(spl_list)),
+                    "WPs": sum(waypoint_reached_list),
+                    "Haz%": (sum(hazard_collision_list) / len(hazard_collision_list)) * 100.0,
+                },
+            )
     finally:
         if emitter is not None:
             emitter.close()
@@ -313,6 +342,8 @@ def evaluate_navigation(
         "spl": float(spl_val),
         "spl_pct": float(spl_pct),
         "waypoint_completion_pct": float(wp_comp_pct),
+        "mean_targets_reached": float(np.mean(waypoint_reached_list)),
+        "num_targets": int(num_targets),
         "hazard_collision_rate_pct": float(hazard_rate_pct),
         "empirical_mflops_per_step": float(empirical_mflops),
         "latency_ms_per_step": float(latency_ms),
@@ -390,8 +421,33 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max_steps",
         type=int,
-        default=250,
-        help="Maximum steps allowed per episode.",
+        default=None,
+        help="Maximum steps allowed per episode (defaults to 250 for rl1, 600 for rl2).",
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="rl1",
+        choices=["rl1", "rl2"],
+        help="Evaluation task mode: rl1 (single target) or rl2 (5-target chain with compass occlusion).",
+    )
+    parser.add_argument(
+        "--num_targets",
+        type=int,
+        default=None,
+        help="Number of chained targets per episode (defaults to 1 for rl1, 5 for rl2).",
+    )
+    parser.add_argument(
+        "--compass_occlusion",
+        type=float,
+        default=None,
+        help="Probability of compass occlusion bursts (defaults to 0.0 for rl1, 0.5 for rl2).",
+    )
+    parser.add_argument(
+        "--occlusion_burst",
+        type=int,
+        default=6,
+        help="Contiguous burst length in ticks for compass occlusion (default: 6).",
     )
     parser.add_argument(
         "--use_gating",
@@ -450,27 +506,72 @@ def main(args: Optional[List[str]] = None) -> int:
     else:
         raise ValueError(f"Unknown model_type: {opts.model_type}")
 
+    # Auto-resolve backbone checkpoint if not specified
+    if not opts.backbone_ckpt:
+        for candidate in [
+            "checkpoints/spatial_finetuned_best.pkl",
+            "checkpoints/m1_full_temporal/spatial_finetuned_best.pkl",
+            "checkpoints/m2_spatial_jepa/best.pkl",
+        ]:
+            if os.path.isfile(candidate):
+                opts.backbone_ckpt = candidate
+                break
+
+    # Auto-resolve temporal checkpoint if not specified and m1_full
+    if opts.model_type == "m1_full" and not opts.temporal_ckpt:
+        for candidate in [
+            "checkpoints/temporal_best.pkl",
+            "checkpoints/m1_full_temporal/temporal_best.pkl",
+        ]:
+            if os.path.isfile(candidate):
+                opts.temporal_ckpt = candidate
+                break
+
+    # Auto-resolve policy checkpoint if not specified
+    if not opts.policy_ckpt:
+        for candidate in [
+            "checkpoints/ppo_nav/policy_best.pkl",
+        ]:
+            if os.path.isfile(candidate):
+                opts.policy_ckpt = candidate
+                break
+
     if opts.backbone_ckpt and os.path.exists(opts.backbone_ckpt):
         print(f"Loading backbone from {opts.backbone_ckpt}...")
         load_checkpoint(opts.backbone_ckpt, backbone)
+    elif opts.backbone_ckpt:
+        print(f"Warning: backbone checkpoint not found at {opts.backbone_ckpt}, using initial weights.")
 
     if temporal_model and opts.temporal_ckpt and os.path.exists(opts.temporal_ckpt):
         print(f"Loading temporal model from {opts.temporal_ckpt}...")
         load_checkpoint(opts.temporal_ckpt, temporal_model)
+    elif temporal_model and opts.temporal_ckpt:
+        print(f"Warning: temporal checkpoint not found at {opts.temporal_ckpt}, using initial weights.")
 
     # 2. Instantiate Policy
     policy = ActorCriticHead(feat_dim=feat_dim, num_actions=12, rngs=rng)
     if opts.policy_ckpt and os.path.exists(opts.policy_ckpt):
         print(f"Loading policy checkpoint from {opts.policy_ckpt}...")
         load_checkpoint(opts.policy_ckpt, policy)
+    elif opts.policy_ckpt:
+        print(f"Warning: policy checkpoint not found at {opts.policy_ckpt}, using initial weights.")
 
     # 3. Load Courses
     courses = None
     if opts.courses_dir and os.path.isdir(opts.courses_dir):
         courses = load_courses_from_dir(opts.courses_dir)
 
+    num_targets = opts.num_targets if opts.num_targets is not None else (5 if opts.task == "rl2" else 1)
+    compass_occlusion = (
+        opts.compass_occlusion
+        if opts.compass_occlusion is not None
+        else (0.5 if opts.task == "rl2" else 0.0)
+    )
+    default_max_steps = 600 if opts.task == "rl2" or num_targets > 1 else 250
+    resolved_max_steps = opts.max_steps if opts.max_steps is not None else default_max_steps
+
     num_episodes = 2 if opts.smoke_test else opts.num_episodes
-    max_steps = 25 if opts.smoke_test else opts.max_steps
+    max_steps = 25 if opts.smoke_test else resolved_max_steps
 
     # 4. Evaluate Navigation
     results = evaluate_navigation(
@@ -484,6 +585,9 @@ def main(args: Optional[List[str]] = None) -> int:
         fps=opts.fps,
         num_episodes=num_episodes,
         max_steps=max_steps,
+        num_targets=num_targets,
+        compass_occlusion_prob=compass_occlusion,
+        occlusion_burst_len=opts.occlusion_burst,
         use_gating=opts.use_gating,
         tau_gate=opts.tau_gate,
         seed=opts.seed,
