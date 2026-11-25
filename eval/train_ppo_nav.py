@@ -146,7 +146,7 @@ def extract_step_feature(
 
     Args:
         backbone: Initialized/trained perception backbone module.
-        model_type: In {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"}.
+        model_type: In {"m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b0_blind"}.
         shells: (3, 16, 16, 16, 16) or (1, 3, 16, 16, 16, 16) float32 shells array in [0, 1].
         state: Optional (12,) proprioceptive state.
         action: Optional scalar action taken at previous step.
@@ -158,6 +158,9 @@ def extract_step_feature(
           - feat: (1, feat_dim) JAX array
           - updated_temporal_hidden: updated hidden state or None
     """
+    if model_type == "b0_blind":
+        return jnp.zeros((1, 0), dtype=jnp.float32), None
+
     shells_arr = jnp.asarray(shells, dtype=jnp.float32)
     if shells_arr.ndim == 5:
         shells_arr = jnp.expand_dims(shells_arr, axis=0)
@@ -393,7 +396,7 @@ def train_bc_warmstart(
         List of epoch cross-entropy losses.
     """
     if dataset is None:
-        if env is None or backbone is None:
+        if env is None or (backbone is None and model_type != "b0_blind"):
             return []
 
         # Collect diverse multi-episode oracle demonstrations
@@ -830,8 +833,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--model_type",
         type=str,
         default="m2_static",
-        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"],
-        help="Frozen perception backbone architecture.",
+        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b0_blind"],
+        help="Frozen perception backbone architecture (or b0_blind for compass-only baseline).",
     )
     parser.add_argument(
         "--ckpt",
@@ -885,26 +888,32 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--task",
         type=str,
         default="rl1",
-        choices=["rl1", "rl2"],
-        help="Navigation task mode: rl1 (single target) or rl2 (5-target chain with compass occlusion).",
+        choices=["rl1", "rl2", "rl3_beacon", "rl3_flash", "rl4_beacon", "rl4_flash"],
+        help="Navigation task mode: rl1, rl2, rl3_beacon, rl3_flash, rl4_beacon, or rl4_flash.",
     )
     parser.add_argument(
         "--num_targets",
         type=int,
         default=None,
-        help="Number of chained targets per episode (defaults to 1 for rl1, 5 for rl2).",
+        help="Number of chained targets per episode (defaults to 1 for rl1/rl3, 5 for rl2/rl4).",
     )
     parser.add_argument(
         "--compass_occlusion",
         type=float,
         default=None,
-        help="Probability of compass occlusion bursts (defaults to 0.0 for rl1, 0.5 for rl2).",
+        help="Probability of compass occlusion bursts (defaults to 0.0 for rl1/flash, 0.5 for rl2, 1.0 for beacon).",
     )
     parser.add_argument(
         "--occlusion_burst",
         type=int,
         default=6,
         help="Contiguous burst length in ticks for compass occlusion (default: 6).",
+    )
+    parser.add_argument(
+        "--flash_compass_ticks",
+        type=int,
+        default=None,
+        help="Number of initial ticks per target leg with visible compass in flash mode (defaults to 3 for rl3_flash/rl4_flash, 0 otherwise).",
     )
     parser.add_argument(
         "--init_policy",
@@ -975,11 +984,14 @@ def main(args: Optional[List[str]] = None) -> int:
     elif opts.model_type == "b3_mae":
         backbone = Generative3DMAE(rngs=rng)
         feat_dim = 256
+    elif opts.model_type == "b0_blind":
+        backbone = None
+        feat_dim = 0
     else:
         raise ValueError(f"Unknown model_type: {opts.model_type}")
 
     # Auto-resolve backbone checkpoint if not specified
-    if not opts.ckpt:
+    if opts.model_type != "b0_blind" and not opts.ckpt:
         for candidate in [
             "checkpoints/spatial_finetuned_best.pkl",
             "checkpoints/m1_full_temporal/spatial_finetuned_best.pkl",
@@ -999,10 +1011,10 @@ def main(args: Optional[List[str]] = None) -> int:
                 opts.temporal_ckpt = candidate
                 break
 
-    if opts.ckpt and os.path.exists(opts.ckpt):
+    if backbone is not None and opts.ckpt and os.path.exists(opts.ckpt):
         print(f"Loading backbone checkpoint from {opts.ckpt}...")
         load_checkpoint(opts.ckpt, backbone)
-    elif opts.ckpt:
+    elif backbone is not None and opts.ckpt:
         print(f"Warning: backbone checkpoint not found at {opts.ckpt}, proceeding with initial weights.")
 
     if temporal_model and opts.temporal_ckpt and os.path.exists(opts.temporal_ckpt):
@@ -1012,24 +1024,37 @@ def main(args: Optional[List[str]] = None) -> int:
         print(f"Warning: temporal checkpoint not found at {opts.temporal_ckpt}, proceeding with initial weights.")
 
     # 2. Instantiate Environment
-    num_targets = opts.num_targets if opts.num_targets is not None else (5 if opts.task == "rl2" else 1)
+    task_defaults = {
+        "rl1": (1, 0.0, 0),
+        "rl2": (5, 0.5, 0),
+        "rl3_beacon": (1, 1.0, 0),
+        "rl3_flash": (1, 0.0, 3),
+        "rl4_beacon": (5, 1.0, 0),
+        "rl4_flash": (5, 0.0, 3),
+    }
+    def_targets, def_occ, def_flash = task_defaults[opts.task]
+    num_targets = opts.num_targets if opts.num_targets is not None else def_targets
     compass_occlusion = (
-        opts.compass_occlusion
-        if opts.compass_occlusion is not None
-        else (0.5 if opts.task == "rl2" else 0.0)
+        opts.compass_occlusion if opts.compass_occlusion is not None else def_occ
+    )
+    flash_compass_ticks = (
+        opts.flash_compass_ticks if opts.flash_compass_ticks is not None else def_flash
     )
 
     if opts.region_dir and os.path.isdir(opts.region_dir):
         from env.minecraft_env import MinecraftNavEnv
         print(
             f"Instantiating MinecraftNavEnv on real terrain from {opts.region_dir} "
-            f"(task={opts.task}, num_targets={num_targets}, compass_occlusion={compass_occlusion}, burst={opts.occlusion_burst})..."
+            f"(task={opts.task}, num_targets={num_targets}, compass_occlusion={compass_occlusion}, "
+            f"flash_ticks={flash_compass_ticks}, burst={opts.occlusion_burst})..."
         )
         env = MinecraftNavEnv(
             region_dir=opts.region_dir,
             num_targets=num_targets,
             compass_occlusion_prob=compass_occlusion,
             occlusion_burst_len=opts.occlusion_burst,
+            flash_compass_ticks=flash_compass_ticks,
+            skip_shells=(opts.model_type == "b0_blind"),
         )
     elif opts.courses_dir and os.path.isdir(opts.courses_dir):
         from eval.eval_navigation import load_courses_from_dir

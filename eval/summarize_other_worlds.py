@@ -69,6 +69,7 @@ def summarize_other_worlds(
             "task": task,
             "success_rate_pct": float(d.get("success_rate_pct", 0.0)),
             "spl": float(d.get("spl", 0.0)),
+            "chns": float(d.get("chns", 0.0)),
             "waypoint_completion_pct": float(d.get("waypoint_completion_pct", 0.0)),
             "mean_targets_reached": float(d.get("mean_targets_reached", 0.0)),
             "hazard_collision_rate_pct": float(d.get("hazard_collision_rate_pct", 0.0)),
@@ -100,12 +101,12 @@ def summarize_other_worlds(
         colors = ["#004D40", "#1E88E5", "#D81B60", "#E65100"]
         hatches = ["", "///", "\\\\", "..."]
 
-        fig, (ax_sr, ax_spl) = plt.subplots(1, 2, figsize=(7.2, 3.0), dpi=300)
+        fig, (ax_sr, ax_spl, ax_chns) = plt.subplots(1, 3, figsize=(9.6, 3.0), dpi=300)
         x = np.arange(len(worlds))
         w = 0.75 / max(1, len(series_keys))
 
         for idx, sk in enumerate(series_keys):
-            sr_vals, spl_vals = [], []
+            sr_vals, spl_vals, chns_vals = [], [], []
             for w_name in worlds:
                 match = [
                     r for r in rows
@@ -113,12 +114,14 @@ def summarize_other_worlds(
                 ]
                 sr_vals.append(match[0]["success_rate_pct"] if match else 0.0)
                 spl_vals.append(match[0]["spl"] if match else 0.0)
+                chns_vals.append(match[0]["chns"] if match else 0.0)
 
             offset = (idx - (len(series_keys) - 1) / 2.0) * w
             c = colors[idx % len(colors)]
             h = hatches[idx % len(hatches)]
             ax_sr.bar(x + offset, sr_vals, w, label=sk, color=c, edgecolor="#222222", hatch=h, linewidth=0.7)
             ax_spl.bar(x + offset, spl_vals, w, label=sk, color=c, edgecolor="#222222", hatch=h, linewidth=0.7)
+            ax_chns.bar(x + offset, chns_vals, w, label=sk, color=c, edgecolor="#222222", hatch=h, linewidth=0.7)
 
         ax_sr.set_title("(a) Zero-Shot Success Rate (%)", fontweight="bold")
         ax_sr.set_ylabel("Success Rate (%)")
@@ -133,6 +136,13 @@ def summarize_other_worlds(
         ax_spl.set_xticks(x)
         ax_spl.set_xticklabels([w.replace("_", "\n") for w in worlds], fontsize=7.5)
         ax_spl.grid(axis="y")
+
+        ax_chns.set_title("(c) CHNS Score (0-100)", fontweight="bold")
+        ax_chns.set_ylabel("CHNS")
+        ax_chns.set_ylim(0, 105)
+        ax_chns.set_xticks(x)
+        ax_chns.set_xticklabels([w.replace("_", "\n") for w in worlds], fontsize=7.5)
+        ax_chns.grid(axis="y")
 
         handles, labels = ax_sr.get_legend_handles_labels()
         fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.03), ncol=len(series_keys), frameon=True)

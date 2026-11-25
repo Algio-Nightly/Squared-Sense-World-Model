@@ -13,9 +13,10 @@ All models operate strictly **channel-last** `(..., X, Y, Z, C)` on 3 concentric
 | **`B1` (`b1_lod0`)** | Single-LOD JEPA on LOD-0 ($1\times$, 64 tokens, `256`-D feat) | 4,648,672 | 3,647,136 | 555.2 |
 | **`B2` (`b2_lod2`)** | Single-LOD JEPA on LOD-2 ($4\times$, 64 tokens, `256`-D feat) | 4,648,672 | 3,647,136 | 555.2 |
 | **`B3` (`b3_mae`)** | Generative 3D-MAE (Multi-LOD encoder + 3D patch decoder, `256`-D feat) | 4,797,792 | 3,647,648 | 1,770.1 |
+| **`B0` (`b0_blind`)** | Blind Compass-Only Baseline (zero voxel perception, `goal_vec` only) | 0 (18,701 head) | 0 (18,701 head) | 0.0 (0.037 MLP) |
 
 - **Event-Driven Shell Gating (`models/gating.py`)**: Host-side stateful cache (`EventDrivenShellGate`, `tau_gate=0.05`) that skips unchanged shell CNNs and Transformer passes (`1743.6` nominal dense MFLOPs/step).
-- **Frozen-Backbone Policy (`eval/train_ppo_nav.py`)**: Lightweight `ActorCriticHead` (`51,469` params for `256`-D, `76,045` params for `448`-D `M1`) trained with optional Behavioral Cloning (BC) warm-start and clipped PPO.
+- **Frozen-Backbone Policy (`eval/train_ppo_nav.py`)**: Lightweight `ActorCriticHead` (`18,701` params for `b0_blind`, `51,469` params for `256`-D, `76,045` params for `448`-D `M1`) trained with optional Behavioral Cloning (BC) warm-start and clipped PPO.
 
 ## Quickstart
 
@@ -43,16 +44,19 @@ uv run python -m train.train_temporal_jepa --spatial_ckpt checkpoints/m2_spatial
 uv run python -m eval.probe_suite --model_type m1_full --ckpt checkpoints/spatial_finetuned_best.pkl --temporal_ckpt checkpoints/temporal_best.pkl --region_dir data/baked_regions --out_json results/probe_m1.json
 ```
 
-### 4. RL1 & RL2 Navigation Training & Evaluation (`MinecraftNavEnv` / `VoxelNavEnv`)
+### 4. RL1–RL4 Navigation Training & Evaluation (`MinecraftNavEnv` / `VoxelNavEnv`)
 ```bash
+# B0: Blind compass-only baseline (RL1)
+uv run python -m eval.train_ppo_nav --model_type b0_blind --region_dir data/baked_regions --task rl1 --bc_epochs 20 --total_steps 50000 --save_dir checkpoints/ppo_nav_b0
+
 # RL1: Single-target curriculum navigation
 uv run python -m eval.train_ppo_nav --model_type m1_full --region_dir data/baked_regions --task rl1 --bc_epochs 20 --total_steps 50000 --save_dir checkpoints/ppo_nav_m1
 
 # RL2: 5-target chained navigation with 50% 6-tick burst compass occlusion
 uv run python -m eval.train_ppo_nav --model_type m1_full --region_dir data/baked_regions --task rl2 --init_policy checkpoints/ppo_nav_m1/best_ppo.pkl --lr 1e-4 --total_steps 25000 --save_dir checkpoints/ppo_nav_m1_rl2
 
-# Zero-shot evaluation (with optional EventDrivenShellGate)
-uv run python -m eval.eval_navigation --model_type m1_full --policy_ckpt checkpoints/ppo_nav_m1_rl2/best_ppo.pkl --region_dir data/baked_regions --task rl2 --num_episodes 20 --use_gating --out_json eval/results_m1_rl2.json
+# Zero-shot evaluation (RL1, RL2, RL3/RL4 beacon & flash dead-reckoning)
+uv run python -m eval.eval_navigation --model_type m1_full --policy_ckpt checkpoints/ppo_nav_m1_rl2/best_ppo.pkl --region_dir data/baked_regions --task rl4_flash --num_episodes 20 --use_gating --out_json eval/results_m1_rl4_flash.json
 ```
 
 ### 5. Publication Vector Figures

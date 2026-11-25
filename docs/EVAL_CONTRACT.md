@@ -32,12 +32,12 @@ Run across 3 random seeds (report mean ± std) with `StandardScaler` fit strictl
   - Per-step time penalty                      : -0.02
 
 ## 4. Frozen-Backbone PPO Policy (`eval/train_ppo_nav.py`, RTX 3050 Mobile friendly)
-- Backbone (`SpatialJEPA` / `SingleLODJEPA` / `Generative3DMAE` + optional `DualLSTM`) is 100% FROZEN (`stop_gradient`).
-- Actor-Critic MLP (~50K params): input `[frozen_feat, goal_dir_3d]` -> `Linear(in, 128) -> GELU -> Linear(128, 128) -> GELU`
+- Backbone (`SpatialJEPA` / `SingleLODJEPA` / `Generative3DMAE` + optional `DualLSTM`) is 100% FROZEN (`stop_gradient`), or omitted for **`b0_blind`** (`feat_dim=0`, `18,701` head params, `0.0` perception MFLOPs/step).
+- Actor-Critic MLP: input `[frozen_feat, goal_dir_3d]` -> `Linear(in, 128) -> GELU -> Linear(128, 128) -> GELU`
   -> Actor head `Linear(128, 12)` + Critic head `Linear(128, 1)`.
-- Supports optional Behavioral Cloning (BC) warm-start from A* demos before PPO fine-tuning, as well as `--init_policy` fine-tuning for **RL2** (`--task rl2`, 5 chained targets, `max_steps=600`, `--compass_occlusion 0.5` in 6-tick bursts, continuous `temporal_hidden` across targets).
+- Supports optional Behavioral Cloning (BC) warm-start from A* demos before PPO fine-tuning, as well as `--init_policy` fine-tuning across the **RL1–RL4** task ladder (`rl1`, `rl2`, `rl3_beacon`, `rl3_flash`, `rl4_beacon`, `rl4_flash`, plus `--flash_compass_ticks`).
 - Zero-Shot Evaluation Metrics (`eval/eval_navigation.py`):
-  Success Rate (SR % / Full5%), SPL, Waypoint Completion %, `mean_targets_reached`, Hazard Collision Rate %, Empirical MFLOPs & Latency (ms).
+  Success Rate (`success_rate_pct` / Full5%), `spl` / `spl_pct`, `chns` (dataset-level Complexity- & Horizon-Weighted Navigation Score in `0..100`), `compass_visible_pct` (% of acted-on steps with visible compass), `waypoint_completion_pct`, `mean_targets_reached`, `hazard_collision_rate_pct`, `empirical_mflops_per_step`, and `latency_ms_per_step`.
 
 ## 5. Publication Figures (`paper_figs/make_figures.py`, Springer LNEE Compliance)
 - Output format: Vector `.pdf` (and 600 DPI `.png` preview).

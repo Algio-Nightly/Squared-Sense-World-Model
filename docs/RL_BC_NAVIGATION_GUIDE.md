@@ -203,20 +203,23 @@ uv run python -m eval.eval_navigation \
 
 ---
 
-## 7. RL2: Multi-Target Chained Navigation with Compass Occlusion
+## 7. RL2–RL4 & `B0` Compass-Ablation Ladder
 
-RL2 extends `MinecraftNavEnv` ([env/minecraft_env.py](file:///c:/Squared%20Sense/Squared%20Sense%20World%20Model/env/minecraft_env.py)) and `train_ppo_nav.py` ([eval/train_ppo_nav.py](file:///c:/Squared%20Sense/Squared%20Sense%20World%20Model/eval/train_ppo_nav.py)) to test **long-horizon spatial memory and temporal persistence** (`M1` Dual-LSTM vs. `M2` static) when the egocentric compass vector is intermittently blacked out.
+RL2–RL4 extend `MinecraftNavEnv` ([env/minecraft_env.py](file:///c:/Squared%20Sense/Squared%20Sense%20World%20Model/env/minecraft_env.py)) and `train_ppo_nav.py` ([eval/train_ppo_nav.py](file:///c:/Squared%20Sense/Squared%20Sense%20World%20Model/eval/train_ppo_nav.py)) to measure **long-horizon spatial memory, temporal persistence, and visual beacon / dead-reckoning reliance** (`M1` Dual-LSTM vs. `M2` static vs. `B0` blind compass-only).
 
-### RL1 vs. RL2 Task Specification
+### Task Ladder Specification (`--task`)
 
-| Parameter | RL1 (`--task rl1`, default) | RL2 (`--task rl2`) |
-| :--- | :---: | :---: |
-| **Targets per Episode (`--num_targets`)** | `1` | `5` (sequentially chained) |
-| **Target Distance Range** | Curriculum-scheduled | `10–24` blocks per leg (BFS-verified) |
-| **Max Steps (`max_steps`)** | `250` | `600` |
-| **Compass Occlusion (`--compass_occlusion`)** | `0.0` (always visible) | `0.5` (~50% occluded in bursts) |
-| **Burst Length (`--occlusion_burst`)** | N/A | `6` contiguous ticks ON / OFF |
-| **Memory (`temporal_hidden`) Across Targets** | N/A (episode ends on target) | **Preserved** (`done=False` until 5/5 or hazard/timeout) |
+| Task | Targets (`--num_targets`) | Max Steps | `--compass_occlusion` | `--flash_compass_ticks` | Purpose |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **`rl1`** (default) | `1` | `250` | `0.0` (100% visible) | `0` | Single-target curriculum navigation |
+| **`rl2`** | `5` (chained) | `600` | `0.5` (6-tick bursts) | `0` | Multi-target memory under intermittent compass blackout |
+| **`rl3_beacon`** | `1` | `250` | `1.0` (0% compass) | `0` | Single-target pure Channel-8 voxel beacon navigation |
+| **`rl3_flash`** | `1` | `250` | `0.0` | `3` (ticks `0,1,2`) | Single-target brief compass flash + dead-reckoning |
+| **`rl4_beacon`** | `5` (chained) | `600` | `1.0` (0% compass) | `0` | 5-target chain with 0% compass (Channel-8 beacons only) |
+| **`rl4_flash`** | `5` (chained) | `600` | `0.0` | `3` per leg | 5-target chain with 3-tick compass flash at start of each leg |
+
+- **`B0` (`b0_blind`) Blind Compass-Only Baseline**: Uses `ActorCriticHead(feat_dim=0)` (`18,701` params, `0.0` perception MFLOPs/step, `skip_shells=True`), bypassing all 3D voxel perception so `--ckpt` is not required.
+- **`--flash_compass_ticks N`**: Overrides the task default (`3` for `rl3_flash`/`rl4_flash`, `0` otherwise). When `flash_compass_ticks > 0`, `MinecraftNavEnv` tracks `_leg_step_count`, keeps `compass_occluded = False` for ticks `0..N-1`, locks `compass_occluded = True` (`goal_vec = [0, 0, 0]`) for `_leg_step_count >= N`, and resets `_leg_step_count = 0` on each mid-chain target arrival.
 
 ### Key RL2 Mechanics
 1. **5-Target Reachable Chain (`reset`)**: Samples a traversable spawn via `SpawnSampler`, then chains 5 distinct reachable targets using `BoundedBfsTargetGenerator` (`10–24` blocks from each previous anchor, retrying alternative cardinal orientations if needed to avoid dead-ends).

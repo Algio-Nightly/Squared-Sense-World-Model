@@ -72,6 +72,8 @@ class MinecraftNavEnv:
         num_targets: int = 1,
         compass_occlusion_prob: float = 0.0,
         occlusion_burst_len: int = 6,
+        flash_compass_ticks: int = 0,
+        skip_shells: bool = False,
     ) -> None:
         self.region_dir = region_dir
         self.palette = palette_obj or get_palette()
@@ -109,6 +111,8 @@ class MinecraftNavEnv:
         self.num_targets = max(1, int(num_targets))
         self.compass_occlusion_prob = float(compass_occlusion_prob)
         self.occlusion_burst_len = max(1, int(occlusion_burst_len))
+        self.flash_compass_ticks = max(0, int(flash_compass_ticks))
+        self.skip_shells = bool(skip_shells)
         if max_steps is None:
             self.max_steps = 600 if self.num_targets > 1 else 250
         else:
@@ -142,6 +146,7 @@ class MinecraftNavEnv:
         self.yaw = 0.0
         self.camera_pitch = 0.0
         self.step_count = 0
+        self._leg_step_count = 0
         self.prev_action = 11  # Stay / Idle
         self.path_length = 0.0
 
@@ -303,7 +308,11 @@ class MinecraftNavEnv:
         return shells
 
     def _get_obs(self) -> Dict[str, np.ndarray]:
-        shells = self._extract_16ch_shells()
+        shells = (
+            np.zeros(SHELL_VOXEL_SHAPE, dtype=np.float32)
+            if self.skip_shells
+            else self._extract_16ch_shells()
+        )
 
         dx, dy, dz = (self.player_pos - self.prev_pos).astype(np.float32)
         yaw_rad = math.radians(self.yaw)
@@ -320,8 +329,8 @@ class MinecraftNavEnv:
             grounded
         ], dtype=np.float32)
 
-        # Egocentric 3D relative goal vector (with optional burst occlusion for RL2)
-        if self.compass_occlusion_prob > 0.0 and self.compass_occluded:
+        # Egocentric 3D relative goal vector (with optional occlusion for RL2/RL3/RL4)
+        if self.compass_occluded:
             goal_vec = np.zeros(3, dtype=np.float32)
         else:
             dx_w = self.target_pos[0] - self.player_pos[0]
@@ -358,6 +367,7 @@ class MinecraftNavEnv:
         self.yaw = CARDINAL_YAW_DEG[self.cardinal]
         self.camera_pitch = 0.0
         self.step_count = 0
+        self._leg_step_count = 0
         self.path_length = 0.0
         self.prev_action = 11
 
@@ -411,9 +421,15 @@ class MinecraftNavEnv:
         self.target_pos = self.targets[0]
         self.optimal_path = self.target_paths[0]
 
-        # 4. Initialize burst compass occlusion state
+        # 4. Initialize compass occlusion state (RL3/RL4 flash & beacon precedence)
         self._occlusion_rng = rng
-        if self.compass_occlusion_prob > 0.0:
+        if self.flash_compass_ticks > 0:
+            self._occlusion_phase = 0
+            self.compass_occluded = False
+        elif self.compass_occlusion_prob >= 1.0:
+            self._occlusion_phase = 0
+            self.compass_occluded = True
+        elif self.compass_occlusion_prob > 0.0:
             self._occlusion_phase = int(rng.integers(0, self.occlusion_burst_len))
             self.compass_occluded = bool(rng.random() < self.compass_occlusion_prob)
         else:
@@ -423,7 +439,9 @@ class MinecraftNavEnv:
         return self._get_obs()
 
     def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, Dict[str, Any]]:
+        was_occluded = bool(self.compass_occluded)
         self.step_count += 1
+        self._leg_step_count += 1
         self.prev_pos = np.copy(self.player_pos)
         prev_yaw = self.yaw
         d_prev = self._distance_to_target()
@@ -546,7 +564,8 @@ class MinecraftNavEnv:
                 self.curriculum.record_result(True, self.path_length, self.shortest_path_len)
             else:
                 # Advance to next target in chain without terminating episode or resetting memory.
-                # Note: d_prev and cos_prev on the next tick will be computed against this new self.target_pos.
+                # Reset leg tick counter so RL3/RL4 flash mode grants a fresh compass flash per leg.
+                self._leg_step_count = 0
                 self.target_pos = self.targets[self.target_idx]
                 self.optimal_path = self.target_paths[self.target_idx]
 
@@ -556,8 +575,12 @@ class MinecraftNavEnv:
             if not success:
                 self.curriculum.record_result(False, self.path_length, self.shortest_path_len)
 
-        # Update burst compass occlusion state for the next observation
-        if self.compass_occlusion_prob > 0.0:
+        # Update compass occlusion state for the next observation
+        if self.flash_compass_ticks > 0:
+            self.compass_occluded = self._leg_step_count >= self.flash_compass_ticks
+        elif self.compass_occlusion_prob >= 1.0:
+            self.compass_occluded = True
+        elif self.compass_occlusion_prob > 0.0:
             if (self.step_count + self._occlusion_phase) % self.occlusion_burst_len == 0:
                 if abs(self.compass_occlusion_prob - 0.5) < 1e-6:
                     self.compass_occluded = not self.compass_occluded
@@ -573,7 +596,7 @@ class MinecraftNavEnv:
             "waypoints_reached": self.targets_reached,
             "total_waypoints": self.num_targets,
             "target_reach_steps": list(self._target_reach_steps),
-            "compass_occluded": self.compass_occluded,
+            "compass_occluded": was_occluded,
             "collision": collision,
             "blocked": blocked,
             "shortest_path_len": self.shortest_path_len,

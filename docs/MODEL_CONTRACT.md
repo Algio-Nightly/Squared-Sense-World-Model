@@ -26,5 +26,6 @@
 5. `models/baselines.py`     :
    - Baseline A (`B1`/`B2` `SingleLODJEPA`, 1 shell, 64 tokens): **4,648,672** trainable / **3,647,136** inference
    - Baseline B (`B3` `Generative3DMAE`, 3 shells, 192 tokens): **4,797,792** trainable (3,647,648 enc + 1,150,144 dec) / **3,647,648** inference
-6. `eval/train_ppo_nav.py`   : `ActorCriticHead` -> **51,469** params (`feat_dim=256`), **76,045** params (`feat_dim=448`)
+   - Baseline 0 (`B0` `b0_blind`, compass-only): **0** perception params / **0.0** perception MFLOPs/step (**0.037** MFLOPs/step for 3-input `ActorCriticHead`)
+6. `eval/train_ppo_nav.py`   : `ActorCriticHead` -> **18,701** params (`feat_dim=0`, `b0_blind`), **51,469** params (`feat_dim=256`), **76,045** params (`feat_dim=448`)
 

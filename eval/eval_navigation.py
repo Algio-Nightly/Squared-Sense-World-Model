@@ -54,6 +54,7 @@ DENSE_MFLOPS_BY_MODEL: Dict[str, float] = {
     "b3_mae": 1770.06,
     "b1_lod0": 555.15,
     "b2_lod2": 555.15,
+    "b0_blind": 0.0,  # 0.0 perception MFLOPs (~0.037 MFLOPs for 3-input ActorCriticHead)
 }
 
 
@@ -104,6 +105,7 @@ def evaluate_navigation(
     num_targets: int = 1,
     compass_occlusion_prob: float = 0.0,
     occlusion_burst_len: int = 6,
+    flash_compass_ticks: int = 0,
     use_gating: bool = False,
     tau_gate: float = 0.05,
     greedy: bool = True,
@@ -145,6 +147,8 @@ def evaluate_navigation(
             num_targets=num_targets,
             compass_occlusion_prob=compass_occlusion_prob,
             occlusion_burst_len=occlusion_burst_len,
+            flash_compass_ticks=flash_compass_ticks,
+            skip_shells=(model_type == "b0_blind" and not visualize),
         )
         actual_episodes = num_episodes
     else:
@@ -160,6 +164,8 @@ def evaluate_navigation(
 
     success_list = []
     spl_list = []
+    chns_num = 0.0
+    chns_den = 0.0
     waypoint_reached_list = []
     total_waypoint_list = []
     hazard_collision_list = []
@@ -170,6 +176,7 @@ def evaluate_navigation(
 
     total_infer_time = 0.0
     total_steps = 0
+    compass_visible_steps = 0
     step_delay = 1.0 / fps if (visualize and fps > 0) else 0.0
 
     # 2. Setup Gating Wrapper if enabled
@@ -211,6 +218,29 @@ def evaluate_navigation(
 
             breadcrumbs = [tuple(curr_player)]
             bfs_tuples = [tuple(p) for p in optimal_path]
+
+            # Per-leg reference lengths L_k for CHNS
+            if len(waypoints) <= 1:
+                leg_refs = [max(1.0, float(l_ref))]
+            elif use_real_world and hasattr(env, "target_paths") and len(getattr(env, "target_paths", [])) == len(waypoints):
+                leg_refs = []
+                prev_anchor = np.array(curr_player, dtype=float)
+                for p_list, wp in zip(env.target_paths, waypoints):
+                    if p_list and len(p_list) > 1:
+                        leg_refs.append(max(1.0, float(len(p_list) - 1)))
+                    else:
+                        leg_refs.append(max(1.0, float(np.linalg.norm(np.array(wp, dtype=float) - prev_anchor))))
+                    prev_anchor = np.array(wp, dtype=float)
+            else:
+                leg_refs = []
+                prev_anchor = np.array(curr_player, dtype=float)
+                for wp in waypoints:
+                    leg_refs.append(max(1.0, float(np.linalg.norm(np.array(wp, dtype=float) - prev_anchor))))
+                    prev_anchor = np.array(wp, dtype=float)
+
+            prev_path_len = 0.0
+            prev_wp_reached = 0
+            leg_path_lens: List[float] = []
 
             if gate is not None:
                 gate.reset()
@@ -265,30 +295,62 @@ def evaluate_navigation(
                 next_obs, reward, done, last_info = env.step(action)
                 ep_return += reward
 
+                if not bool(last_info.get("compass_occluded", getattr(env, "compass_occluded", False))):
+                    compass_visible_steps += 1
+
+                curr_path_len = float(last_info.get("path_length", 0.0))
+                curr_wp_reached = int(last_info.get("waypoints_reached", 0))
+                if curr_wp_reached > prev_wp_reached:
+                    leg_p = max(0.0, curr_path_len - prev_path_len)
+                    for _ in range(prev_wp_reached, curr_wp_reached):
+                        leg_path_lens.append(leg_p)
+                        leg_p = 0.0
+                    prev_path_len = curr_path_len
+                    prev_wp_reached = curr_wp_reached
+
                 # Live IPC telemetry stream if enabled
                 if emitter is not None and hasattr(env, "extractor"):
                     curr_pos = getattr(env, "player_pos", curr_player)
+                    active_tgt = tuple(getattr(env, "target_pos", target_tuple))
+                    curr_bfs = [tuple(p) for p in getattr(env, "optimal_path", bfs_tuples)]
+                    all_tgts = list(getattr(env, "targets", [active_tgt]))
+                    t_idx = int(getattr(env, "target_idx", 0))
+                    t_reached = int(getattr(env, "targets_reached", 0))
+                    occluded = bool(getattr(env, "compass_occluded", False))
+
                     breadcrumbs.append(tuple(curr_pos))
                     if len(breadcrumbs) > 64:
                         breadcrumbs.pop(0)
 
-                    d_curr = float(np.linalg.norm(np.array(curr_pos) - np.array(target_tuple)))
-                    world_dx = float(target_tuple[0] - curr_pos[0])
-                    world_dy = float(target_tuple[1] - curr_pos[1])
-                    world_dz = float(target_tuple[2] - curr_pos[2])
+                    d_curr = float(np.linalg.norm(np.array(curr_pos) - np.array(active_tgt)))
+                    world_dx = float(active_tgt[0] - curr_pos[0])
+                    world_dy = float(active_tgt[1] - curr_pos[1])
+                    world_dz = float(active_tgt[2] - curr_pos[2])
                     bc_rel = [(p[0] - curr_pos[0], p[1] - curr_pos[1], p[2] - curr_pos[2]) for p in breadcrumbs]
-                    bfs_rel = [(p[0] - curr_pos[0], p[1] - curr_pos[1], p[2] - curr_pos[2]) for p in bfs_tuples[:64]]
+                    bfs_rel = [(p[0] - curr_pos[0], p[1] - curr_pos[1], p[2] - curr_pos[2]) for p in curr_bfs[:64]]
+                    wps_rel = [
+                        (int(round(t[0] - curr_pos[0])), int(round(t[1] - curr_pos[1])), int(round(t[2] - curr_pos[2])))
+                        for t in all_tgts[:16]
+                    ]
 
                     telem_bytes = InferenceTelemetry.pack(
-                        target_pos=(target_tuple[0], target_tuple[1], target_tuple[2]),
+                        target_pos=(active_tgt[0], active_tgt[1], active_tgt[2]),
                         world_delta=(world_dx, world_dy, world_dz),
                         target_dist=d_curr,
                         step_reward=float(reward),
                         episode_return=float(ep_return),
+                        step_count=step_count,
                         critic_value=v_est,
                         action_probabilities=list(action_probs),
+                        chosen_action=action,
+                        l_bfs=int(round(l_ref)),
                         breadcrumbs=bc_rel,
                         optimal_path=bfs_rel,
+                        waypoints=wps_rel,
+                        active_target_idx=t_idx,
+                        total_targets=len(all_tgts),
+                        targets_reached=t_reached,
+                        compass_occluded=occluded,
                     )
                     cardinal_str = getattr(env, "cardinal", "SOUTH")
                     foot_idx = getattr(env, "foot_index", 6)
@@ -326,6 +388,16 @@ def evaluate_navigation(
                 if t_k in target_reach_steps_by_k:
                     target_reach_steps_by_k[t_k].append(int(t_step))
 
+            k_total = max(1, len(leg_refs))
+            for leg_idx, l_k in enumerate(leg_refs, start=1):
+                w_k = float(l_k)
+                m_k = 1.0 + 0.5 * (leg_idx - 1) / max(k_total - 1, 1)
+                chns_den += w_k * m_k
+                if leg_idx <= len(leg_path_lens):
+                    p_k = leg_path_lens[leg_idx - 1]
+                    eta_k = min(1.0, w_k / max(p_k, w_k))
+                    chns_num += w_k * m_k * eta_k
+
             pb.update(
                 ep_idx + 1,
                 metrics={
@@ -355,12 +427,18 @@ def evaluate_navigation(
     else:
         empirical_mflops = float(DENSE_MFLOPS_BY_MODEL.get(model_type, DENSE_MFLOPS_PER_STEP))
 
+    chns_score = float(100.0 * chns_num / max(chns_den, 1e-8))
+    compass_visible_pct = 100.0 * compass_visible_steps / max(1, total_steps)
     latency_ms = (total_infer_time / max(1, total_steps)) * 1000.0
 
     results = {
         "success_rate_pct": float(sr_pct),
         "spl": float(spl_val),
         "spl_pct": float(spl_pct),
+        "chns": chns_score,
+        "compass_visible_pct": float(compass_visible_pct),
+        "compass_occlusion_prob": float(compass_occlusion_prob),
+        "flash_compass_ticks": int(flash_compass_ticks),
         "waypoint_completion_pct": float(wp_comp_pct),
         "mean_targets_reached": float(np.mean(waypoint_reached_list)),
         "num_targets": int(num_targets),
@@ -397,8 +475,8 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--model_type",
         type=str,
         default="m2_static",
-        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae"],
-        help="Frozen perception backbone architecture.",
+        choices=["m1_full", "m2_static", "b1_lod0", "b2_lod2", "b3_mae", "b0_blind"],
+        help="Frozen perception backbone architecture (or b0_blind for compass-only baseline).",
     )
     parser.add_argument(
         "--backbone_ckpt",
@@ -451,26 +529,32 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         "--task",
         type=str,
         default="rl1",
-        choices=["rl1", "rl2"],
-        help="Evaluation task mode: rl1 (single target) or rl2 (5-target chain with compass occlusion).",
+        choices=["rl1", "rl2", "rl3_beacon", "rl3_flash", "rl4_beacon", "rl4_flash"],
+        help="Evaluation task mode: rl1, rl2, rl3_beacon, rl3_flash, rl4_beacon, or rl4_flash.",
     )
     parser.add_argument(
         "--num_targets",
         type=int,
         default=None,
-        help="Number of chained targets per episode (defaults to 1 for rl1, 5 for rl2).",
+        help="Number of chained targets per episode (defaults to 1 for rl1/rl3, 5 for rl2/rl4).",
     )
     parser.add_argument(
         "--compass_occlusion",
         type=float,
         default=None,
-        help="Probability of compass occlusion bursts (defaults to 0.0 for rl1, 0.5 for rl2).",
+        help="Probability of compass occlusion bursts (defaults to 0.0 for rl1/flash, 0.5 for rl2, 1.0 for beacon).",
     )
     parser.add_argument(
         "--occlusion_burst",
         type=int,
         default=6,
         help="Contiguous burst length in ticks for compass occlusion (default: 6).",
+    )
+    parser.add_argument(
+        "--flash_compass_ticks",
+        type=int,
+        default=None,
+        help="Number of initial ticks per target leg with visible compass in flash mode (defaults to 3 for rl3_flash/rl4_flash, 0 otherwise).",
     )
     parser.add_argument(
         "--use_gating",
@@ -526,11 +610,14 @@ def main(args: Optional[List[str]] = None) -> int:
     elif opts.model_type == "b3_mae":
         backbone = Generative3DMAE(rngs=rng)
         feat_dim = 256
+    elif opts.model_type == "b0_blind":
+        backbone = None
+        feat_dim = 0
     else:
         raise ValueError(f"Unknown model_type: {opts.model_type}")
 
     # Auto-resolve backbone checkpoint if not specified
-    if not opts.backbone_ckpt:
+    if opts.model_type != "b0_blind" and not opts.backbone_ckpt:
         for candidate in [
             "checkpoints/spatial_finetuned_best.pkl",
             "checkpoints/m1_full_temporal/spatial_finetuned_best.pkl",
@@ -550,8 +637,8 @@ def main(args: Optional[List[str]] = None) -> int:
                 opts.temporal_ckpt = candidate
                 break
 
-    # Auto-resolve policy checkpoint if not specified
-    if not opts.policy_ckpt:
+    # Auto-resolve policy checkpoint if not specified (skip default 259-D ckpt for b0_blind)
+    if opts.model_type != "b0_blind" and not opts.policy_ckpt:
         for candidate in [
             "checkpoints/ppo_nav/policy_best.pkl",
         ]:
@@ -559,10 +646,10 @@ def main(args: Optional[List[str]] = None) -> int:
                 opts.policy_ckpt = candidate
                 break
 
-    if opts.backbone_ckpt and os.path.exists(opts.backbone_ckpt):
+    if backbone is not None and opts.backbone_ckpt and os.path.exists(opts.backbone_ckpt):
         print(f"Loading backbone from {opts.backbone_ckpt}...")
         load_checkpoint(opts.backbone_ckpt, backbone)
-    elif opts.backbone_ckpt:
+    elif backbone is not None and opts.backbone_ckpt:
         print(f"Warning: backbone checkpoint not found at {opts.backbone_ckpt}, using initial weights.")
 
     if temporal_model and opts.temporal_ckpt and os.path.exists(opts.temporal_ckpt):
@@ -584,13 +671,23 @@ def main(args: Optional[List[str]] = None) -> int:
     if opts.courses_dir and os.path.isdir(opts.courses_dir):
         courses = load_courses_from_dir(opts.courses_dir)
 
-    num_targets = opts.num_targets if opts.num_targets is not None else (5 if opts.task == "rl2" else 1)
+    task_defaults = {
+        "rl1": (1, 0.0, 0),
+        "rl2": (5, 0.5, 0),
+        "rl3_beacon": (1, 1.0, 0),
+        "rl3_flash": (1, 0.0, 3),
+        "rl4_beacon": (5, 1.0, 0),
+        "rl4_flash": (5, 0.0, 3),
+    }
+    def_targets, def_occ, def_flash = task_defaults[opts.task]
+    num_targets = opts.num_targets if opts.num_targets is not None else def_targets
     compass_occlusion = (
-        opts.compass_occlusion
-        if opts.compass_occlusion is not None
-        else (0.5 if opts.task == "rl2" else 0.0)
+        opts.compass_occlusion if opts.compass_occlusion is not None else def_occ
     )
-    default_max_steps = 600 if opts.task == "rl2" or num_targets > 1 else 250
+    flash_compass_ticks = (
+        opts.flash_compass_ticks if opts.flash_compass_ticks is not None else def_flash
+    )
+    default_max_steps = 600 if num_targets > 1 else 250
     resolved_max_steps = opts.max_steps if opts.max_steps is not None else default_max_steps
 
     num_episodes = 2 if opts.smoke_test else opts.num_episodes
@@ -611,6 +708,7 @@ def main(args: Optional[List[str]] = None) -> int:
         num_targets=num_targets,
         compass_occlusion_prob=compass_occlusion,
         occlusion_burst_len=opts.occlusion_burst,
+        flash_compass_ticks=flash_compass_ticks,
         use_gating=opts.use_gating,
         tau_gate=opts.tau_gate,
         seed=opts.seed,
@@ -620,10 +718,13 @@ def main(args: Optional[List[str]] = None) -> int:
     print("Zero-Shot Navigation Evaluation Summary")
     print("=" * 60)
     print(f"Model Type:               {opts.model_type}")
+    print(f"Task Mode:                {opts.task}")
     print(f"Use Gating:               {results['use_gating']}")
     print(f"Success Rate (SR %):      {results['success_rate_pct']:.2f}%")
     print(f"SPL:                      {results['spl']:.4f} ({results['spl_pct']:.2f}%)")
+    print(f"CHNS (0-100):             {results['chns']:.2f}")
     print(f"Waypoint Completion %:    {results['waypoint_completion_pct']:.2f}%")
+    print(f"Compass Visible %:        {results['compass_visible_pct']:.2f}%")
     print(f"Hazard Collision Rate %:  {results['hazard_collision_rate_pct']:.2f}%")
     print(f"Empirical MFLOPs/step:    {results['empirical_mflops_per_step']:.1f} MFLOPs")
     print(f"Latency (ms/step):        {results['latency_ms_per_step']:.2f} ms")
