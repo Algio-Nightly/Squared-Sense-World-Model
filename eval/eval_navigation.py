@@ -47,6 +47,15 @@ from models.transformer import MultiLODBackbone, SpatialJEPA
 from train.checkpoint import load_checkpoint
 from train.diagnostics import ProgressBar
 
+# Verified XLA cost_analysis() dense MFLOPs/step per model_type
+DENSE_MFLOPS_BY_MODEL: Dict[str, float] = {
+    "m1_full": 1791.30,
+    "m2_static": 1770.06,
+    "b3_mae": 1770.06,
+    "b1_lod0": 555.15,
+    "b2_lod2": 555.15,
+}
+
 
 def load_courses_from_dir(
     courses_dir: str,
@@ -155,6 +164,9 @@ def evaluate_navigation(
     total_waypoint_list = []
     hazard_collision_list = []
     episode_lengths = []
+    target_reach_steps_by_k: Dict[int, List[int]] = {
+        k: [] for k in range(1, num_targets + 1)
+    }
 
     total_infer_time = 0.0
     total_steps = 0
@@ -310,6 +322,9 @@ def evaluate_navigation(
             total_waypoint_list.append(tot_wp)
             hazard_collision_list.append(1.0 if is_hazard else 0.0)
             episode_lengths.append(step_count)
+            for t_k, t_step in enumerate(last_info.get("target_reach_steps", []), start=1):
+                if t_k in target_reach_steps_by_k:
+                    target_reach_steps_by_k[t_k].append(int(t_step))
 
             pb.update(
                 ep_idx + 1,
@@ -338,7 +353,7 @@ def evaluate_navigation(
         stats = gate.get_stats()
         empirical_mflops = float(stats["mflops_per_step"])
     else:
-        empirical_mflops = float(DENSE_MFLOPS_PER_STEP)
+        empirical_mflops = float(DENSE_MFLOPS_BY_MODEL.get(model_type, DENSE_MFLOPS_PER_STEP))
 
     latency_ms = (total_infer_time / max(1, total_steps)) * 1000.0
 
@@ -357,6 +372,9 @@ def evaluate_navigation(
         "total_steps": int(total_steps),
         "mean_episode_length": float(np.mean(episode_lengths)),
     }
+    for t_k in range(1, num_targets + 1):
+        vals_k = target_reach_steps_by_k[t_k]
+        results[f"avg_steps_to_target_{t_k}"] = float(np.mean(vals_k)) if vals_k else None
     return results
 
 

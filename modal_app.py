@@ -171,7 +171,9 @@ def train_spatial(
     warmup_epochs: int = 10,
     alpha: float = 0.1,
     beta: float = 0.04,
+    no_vicreg: bool = False,
     data_dir: str = f"{REMOTE_VOL_PATH}/data",
+    region_dir: str = f"{REMOTE_VOL_PATH}/data/baked_regions",
     save_dir: str = f"{REMOTE_VOL_PATH}/checkpoints/m2_spatial_jepa",
     log_every: int = 25,
     smoke_test: bool = False,
@@ -203,10 +205,15 @@ def train_spatial(
         "--as_uint8",
         "--drop_last",
     ]
+    if no_vicreg:
+        cmd.append("--no_vicreg")
     if smoke_test:
         cmd.append("--smoke_test")
-    elif os.path.exists(data_dir):
-        cmd.extend(["--data_dir", data_dir])
+    else:
+        if os.path.exists(data_dir):
+            cmd.extend(["--data_dir", data_dir])
+        if os.path.exists(region_dir):
+            cmd.extend(["--region_dir", region_dir])
 
     _exec_command(cmd)
     vol.commit()
@@ -231,12 +238,13 @@ def train_baselines(
     batch_size: int = 32,
     lr: float = 3e-4,
     data_dir: str = f"{REMOTE_VOL_PATH}/data",
+    region_dir: str = f"{REMOTE_VOL_PATH}/data/baked_regions",
     save_dir_prefix: str = f"{REMOTE_VOL_PATH}/checkpoints/baselines",
     log_every: int = 25,
     smoke_test: bool = False,
 ) -> List[str]:
-    """Train parameter-matched baseline models: B1 (LOD-0), B2 (LOD-2), B3 (3D-MAE)."""
-    targets = ["b1_lod0", "b2_lod2", "b3_mae"] if model == "all" else [model]
+    """Train parameter-matched baseline models: B1 (LOD-0), B2 (LOD-2), B3 (3D-MAE), B4 (Uniform 32^3)."""
+    targets = ["b1_lod0", "b2_lod2", "b3_mae", "b4_uniform32"] if model == "all" else [model]
     trained = []
 
     for tgt in targets:
@@ -264,8 +272,11 @@ def train_baselines(
         ]
         if smoke_test:
             cmd.append("--smoke_test")
-        elif os.path.exists(data_dir):
-            cmd.extend(["--data_dir", data_dir])
+        else:
+            if os.path.exists(data_dir):
+                cmd.extend(["--data_dir", data_dir])
+            if os.path.exists(region_dir):
+                cmd.extend(["--region_dir", region_dir])
 
         _exec_command(cmd)
         vol.commit()
@@ -629,6 +640,7 @@ def main(
     batch_size: int = 32,
     model: str = "all",
     log_every: int = 25,
+    no_vicreg: bool = False,
     smoke_test: bool = False,
 ):
     """Local CLI driver for Modal executions.
@@ -648,7 +660,15 @@ def main(
     if act in ("verify", "check", "gpu"):
         verify_gpu.remote()
     elif act in ("train-spatial", "spatial", "m2"):
-        train_spatial.remote(epochs=epochs, batch_size=batch_size, log_every=log_every, smoke_test=smoke_test)
+        save_dir = f"{REMOTE_VOL_PATH}/checkpoints/m2_no_vicreg" if no_vicreg else f"{REMOTE_VOL_PATH}/checkpoints/m2_spatial_jepa"
+        train_spatial.remote(
+            epochs=epochs,
+            batch_size=batch_size,
+            log_every=log_every,
+            no_vicreg=no_vicreg,
+            save_dir=save_dir,
+            smoke_test=smoke_test,
+        )
     elif act in ("train-baselines", "baselines"):
         train_baselines.remote(model=model, epochs=epochs, batch_size=batch_size, log_every=log_every, smoke_test=smoke_test)
     elif act in ("train-temporal", "temporal", "m1"):

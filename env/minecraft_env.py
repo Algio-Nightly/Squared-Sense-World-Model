@@ -78,20 +78,28 @@ class MinecraftNavEnv:
         self.world = WorldVolume(region_dir, palette_obj=self.palette)
 
         if spawns_path is None:
-            candidates = glob.glob(os.path.join(region_dir, "*.spawns.npz"))
-            if candidates:
-                spawns_path = candidates[0]
-            else:
-                spawns_path = None
+            candidates = sorted(glob.glob(os.path.join(region_dir, "*.spawns.npz")))
+        else:
+            candidates = [spawns_path] if os.path.exists(spawns_path) else []
 
-        if not spawns_path or not os.path.exists(spawns_path):
+        if not candidates:
             raise FileNotFoundError(
                 f"No '*.spawns.npz' files found in region_dir '{region_dir}'. "
                 f"Precompute traversable spawns first using: "
                 f"uv run python -m env.spawn_indexer --region_dir \"{region_dir}\""
             )
 
-        self.spawn_sampler = SpawnSampler.from_npz(spawns_path)
+        self.spawn_sampler = SpawnSampler.from_npz(candidates)
+        if self.world.regions:
+            rxs = [rx for rx, _ in self.world.regions.keys()]
+            rzs = [rz for _, rz in self.world.regions.keys()]
+            self.spawn_sampler.filter_interior_margin(
+                min_x=min(rxs) * 512,
+                max_x=(max(rxs) + 1) * 512 - 1,
+                min_z=min(rzs) * 512,
+                max_z=(max(rzs) + 1) * 512 - 1,
+                margin=64,
+            )
 
         self.extractor = LodExtractor(self.world, self.palette)
         self.kernel = MovementPhysicsKernel(self.world, self.palette)
@@ -122,6 +130,7 @@ class MinecraftNavEnv:
         self.target_paths: List[List[Tuple[int, int, int]]] = []
         self.target_idx = 0
         self.targets_reached = 0
+        self._target_reach_steps: List[int] = []
         self.optimal_path: List[Tuple[int, int, int]] = []
         self.shortest_path_len = 10.0
 
@@ -398,6 +407,7 @@ class MinecraftNavEnv:
 
         self.target_idx = 0
         self.targets_reached = 0
+        self._target_reach_steps = []
         self.target_pos = self.targets[0]
         self.optimal_path = self.target_paths[0]
 
@@ -528,6 +538,7 @@ class MinecraftNavEnv:
         if d_curr <= self.goal_reach_radius:
             reward += 10.0
             self.targets_reached += 1
+            self._target_reach_steps.append(int(self.step_count))
             self.target_idx += 1
             if self.target_idx >= len(self.targets):
                 done = True
@@ -561,6 +572,7 @@ class MinecraftNavEnv:
             "num_targets": self.num_targets,
             "waypoints_reached": self.targets_reached,
             "total_waypoints": self.num_targets,
+            "target_reach_steps": list(self._target_reach_steps),
             "compass_occluded": self.compass_occluded,
             "collision": collision,
             "blocked": blocked,

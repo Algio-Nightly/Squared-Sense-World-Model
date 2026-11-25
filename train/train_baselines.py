@@ -33,7 +33,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from models.baselines import Generative3DMAE, SingleLODJEPA
+from models.baselines import (
+    Generative3DMAE,
+    SingleLODJEPA,
+    Uniform32JEPA,
+    sample_3d_jepa_masks_32,
+)
 from models.transformer import sample_3d_jepa_masks
 from train.checkpoint import load_checkpoint, save_checkpoint
 from train.diagnostics import ProgressBar, append_metrics_jsonl, compute_rankme
@@ -48,10 +53,17 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
+        "--baseline",
+        dest="model",
         type=str,
         required=True,
-        choices=["b1_lod0", "b2_lod2", "b3_mae"],
+        choices=["b1_lod0", "b2_lod2", "b3_mae", "b4_uniform32"],
         help="Baseline model architecture variant to train.",
+    )
+    parser.add_argument(
+        "--allow_upsample_fallback",
+        action="store_true",
+        help="Allow 2x upsampling from LOD-1 for b4_uniform32 when --region_dir is omitted (unit tests only).",
     )
     parser.add_argument(
         "--data_dir",
@@ -296,11 +308,170 @@ def extract_mae_embeddings(model: Generative3DMAE, x: jax.Array) -> jax.Array:
 
 
 # ==============================================================================
+# JIT-Compiled Step Functions for Uniform32JEPA (B4)
+# ==============================================================================
+
+
+@nnx.jit
+def train_step_uniform32(
+    model: Uniform32JEPA,
+    optimizer: nnx.Optimizer,
+    x: jax.Array,
+    rng_key: jax.Array,
+    ema_momentum: float,
+    alpha: float = 0.1,
+    beta: float = 0.04,
+) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    """Single optimization step for Uniform32JEPA baseline."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
+    b = x.shape[0]
+    vis_idx, tgt_idx = sample_3d_jepa_masks_32(rng_key, b)
+
+    def loss_fn(m: Uniform32JEPA):
+        pred_targets, norm_ema, context_tokens = m(x, vis_idx, tgt_idx)
+        loss, metrics = spatial_jepa_loss(pred_targets, norm_ema, context_tokens, alpha=alpha, beta=beta)
+        return loss, metrics
+
+    (loss, metrics), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    optimizer.update(
+        (model.context_encoder, model.predictor),
+        (grads.jepa.context_encoder, grads.jepa.predictor),
+    )
+    model.update_ema(ema_momentum)
+    return loss, metrics
+
+
+@nnx.jit
+def val_step_uniform32(
+    model: Uniform32JEPA,
+    x: jax.Array,
+    rng_key: jax.Array,
+    alpha: float = 0.1,
+    beta: float = 0.04,
+) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+    """Evaluation step for Uniform32JEPA baseline."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
+    b = x.shape[0]
+    vis_idx, tgt_idx = sample_3d_jepa_masks_32(rng_key, b)
+    pred_targets, norm_ema, context_tokens = model(x, vis_idx, tgt_idx)
+    loss, metrics = spatial_jepa_loss(pred_targets, norm_ema, context_tokens, alpha=alpha, beta=beta)
+    metrics["emb_std"] = jnp.mean(jnp.std(context_tokens, axis=0))
+    return loss, metrics
+
+
+@nnx.jit
+def extract_uniform32_embeddings(model: Uniform32JEPA, x: jax.Array) -> jax.Array:
+    """Extract unmasked context representations pooled across 512 tokens."""
+    if x.dtype == jnp.uint8:
+        x = x.astype(jnp.float32) / 255.0
+    if x.ndim == 5:
+        x = jnp.expand_dims(x, axis=1)
+    tokens = model.context_encoder(x, visible_idx=None)  # (B, 512, 256)
+    return jnp.mean(tokens, axis=1)  # (B, 256)
+
+
+def load_uniform32_dataset(
+    data_dir: Optional[str],
+    region_dir: Optional[str],
+    smoke_test: bool,
+    seed: int,
+    as_uint8: bool = True,
+    allow_upsample_fallback: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load true 1x-resolution (N, 32, 32, 32, 16) volumes for B4 Uniform32JEPA.
+
+    Requires --region_dir containing baked .mmap regions unless --smoke_test or
+    --allow_upsample_fallback is explicitly set.
+    """
+    if smoke_test:
+        rng = np.random.default_rng(seed)
+        if as_uint8:
+            return (
+                rng.integers(0, 256, size=(8, 32, 32, 32, 16), dtype=np.uint8),
+                rng.integers(0, 256, size=(4, 32, 32, 32, 16), dtype=np.uint8),
+            )
+        return (
+            rng.uniform(0.0, 1.0, size=(8, 32, 32, 32, 16)).astype(np.float32),
+            rng.uniform(0.0, 1.0, size=(4, 32, 32, 32, 16)).astype(np.float32),
+        )
+
+    if region_dir and os.path.isdir(region_dir):
+        from env.lod_extractor import WorldVolume, extract_uniform32_16ch
+        from env.palette import get_palette
+
+        palette = get_palette()
+        world = WorldVolume(region_dir, palette_obj=palette)
+
+        def _yaw_to_cardinal(sin_y: float, cos_y: float) -> str:
+            yaw = (math.degrees(math.atan2(-sin_y, cos_y)) % 360.0 + 360.0) % 360.0
+            if 45.0 <= yaw < 135.0:
+                return "WEST"
+            if 135.0 <= yaw < 225.0:
+                return "NORTH"
+            if 225.0 <= yaw < 315.0:
+                return "EAST"
+            return "SOUTH"
+
+        if data_dir and os.path.isdir(data_dir):
+            from data.dataset import load_episode_splits
+            splits = load_episode_splits(data_dir, seed=seed, as_uint8=as_uint8)
+            if len(splits["train"]) > 0:
+                def _extract_split(eps):
+                    vols = []
+                    for ep in eps:
+                        meta = ep["meta"]
+                        st = ep["state"]
+                        for t in range(len(meta)):
+                            px, py, pz = int(round(meta[t, 0])), int(round(meta[t, 1])), int(round(meta[t, 2]))
+                            card = _yaw_to_cardinal(float(st[t, 6]), float(st[t, 7]))
+                            pitch = float(st[t, 8])
+                            vols.append(extract_uniform32_16ch(world, palette, (px, py, pz), card, pitch, as_uint8=as_uint8))
+                    return np.stack(vols, axis=0)
+
+                train_v = _extract_split(splits["train"])
+                val_eps = splits["val"] if len(splits["val"]) > 0 else splits["train"][:1]
+                val_v = _extract_split(val_eps)
+                return train_v, val_v
+
+        # Fallback to sampling traversable positions directly from baked region spawns
+        import glob
+        from env.spawn_indexer import SpawnSampler
+        spawns_files = glob.glob(os.path.join(region_dir, "*.spawns.npz"))
+        if not spawns_files:
+            raise FileNotFoundError(f"No .spawns.npz found in region_dir '{region_dir}' for b4_uniform32.")
+        sampler = SpawnSampler.from_npz(spawns_files[0])
+        rng = np.random.default_rng(seed)
+        cards = ["SOUTH", "WEST", "NORTH", "EAST"]
+        train_v = np.stack([
+            extract_uniform32_16ch(world, palette, sampler.sample(rng=rng), str(rng.choice(cards)), 0.0, as_uint8=as_uint8)
+            for _ in range(512)
+        ], axis=0)
+        val_v = np.stack([
+            extract_uniform32_16ch(world, palette, sampler.sample(rng=rng), str(rng.choice(cards)), 0.0, as_uint8=as_uint8)
+            for _ in range(128)
+        ], axis=0)
+        return train_v, val_v
+
+    if allow_upsample_fallback and data_dir:
+        tr, va = load_dataset(data_dir, smoke_test=False, seed=seed, as_uint8=as_uint8)
+        tr32 = np.repeat(np.repeat(np.repeat(tr[:, 1], 2, axis=1), 2, axis=2), 2, axis=3)
+        va32 = np.repeat(np.repeat(np.repeat(va[:, 1], 2, axis=1), 2, axis=2), 2, axis=3)
+        return tr32, va32
+
+    raise ValueError(
+        "b4_uniform32 requires --region_dir pointing to baked Minecraft regions (.mmap) "
+        "for true 1x 32x32x32x16 extraction. Pass --allow_upsample_fallback only for unit tests."
+    )
+
+
+# ==============================================================================
 # Unified Baseline Training Pipeline
 # ==============================================================================
 
 
-def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Generative3DMAE], float]:
+def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Generative3DMAE, Uniform32JEPA], float]:
     """Execute end-to-end training pipeline for the selected baseline model."""
     os.makedirs(args.save_dir, exist_ok=True)
     log_path = os.path.join(args.save_dir, "train.log")
@@ -320,8 +491,9 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
 
     # 1. Instantiate Model & Optimizer
     is_mae = args.model == "b3_mae"
+    is_u32 = args.model == "b4_uniform32"
     if args.model == "b1_lod0":
-        model: Union[SingleLODJEPA, Generative3DMAE] = SingleLODJEPA(
+        model: Union[SingleLODJEPA, Generative3DMAE, Uniform32JEPA] = SingleLODJEPA(
             lod_index=0, rngs=nnx.Rngs(int(jax.random.bits(model_key)))
         )
     elif args.model == "b2_lod2":
@@ -330,13 +502,25 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
         )
     elif args.model == "b3_mae":
         model = Generative3DMAE(rngs=nnx.Rngs(int(jax.random.bits(model_key))))
+    elif args.model == "b4_uniform32":
+        model = Uniform32JEPA(rngs=nnx.Rngs(int(jax.random.bits(model_key))))
     else:
         raise ValueError(f"Unknown baseline model: {args.model}")
 
     # 2. Load Data
     effective_data_dir = args.data_dir or args.region_dir
     as_uint8 = getattr(args, "as_uint8", True)
-    train_x, val_x = load_dataset(effective_data_dir, args.smoke_test, args.seed, as_uint8=as_uint8)
+    if is_u32:
+        train_x, val_x = load_uniform32_dataset(
+            data_dir=args.data_dir,
+            region_dir=args.region_dir,
+            smoke_test=args.smoke_test,
+            seed=args.seed,
+            as_uint8=as_uint8,
+            allow_upsample_fallback=getattr(args, "allow_upsample_fallback", False),
+        )
+    else:
+        train_x, val_x = load_dataset(effective_data_dir, args.smoke_test, args.seed, as_uint8=as_uint8)
     num_train = len(train_x)
     num_val = len(val_x)
     drop_last = getattr(args, "drop_last", True)
@@ -363,7 +547,7 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
     if is_mae:
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
     else:
-        assert isinstance(model, SingleLODJEPA)
+        assert isinstance(model, (SingleLODJEPA, Uniform32JEPA))
         optimizer = nnx.Optimizer((model.context_encoder, model.predictor), tx, wrt=nnx.Param)
 
     best_val_loss = float("inf")
@@ -405,6 +589,18 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
                     optimizer=optimizer,
                     x=batch_x,
                     rng_key=step_key,
+                )
+            elif is_u32:
+                assert isinstance(model, Uniform32JEPA)
+                ema_m = cosine_ema_momentum(global_step, total_steps, start=0.996, end=1.0)
+                loss, metrics = train_step_uniform32(
+                    model=model,
+                    optimizer=optimizer,
+                    x=batch_x,
+                    rng_key=step_key,
+                    ema_momentum=ema_m,
+                    alpha=args.alpha,
+                    beta=args.beta,
                 )
             else:
                 assert isinstance(model, SingleLODJEPA)
@@ -459,6 +655,10 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
                 assert isinstance(model, Generative3DMAE)
                 v_loss, v_metrics = val_step_mae(model, v_batch, v_key)
                 val_pbar.update(v_step + 1, {"ValLoss": v_loss, "MSE": v_metrics.get("mse_loss", v_loss)})
+            elif is_u32:
+                assert isinstance(model, Uniform32JEPA)
+                v_loss, v_metrics = val_step_uniform32(model, v_batch, v_key, alpha=args.alpha, beta=args.beta)
+                val_pbar.update(v_step + 1, {"ValLoss": v_loss, "EmbStd": v_metrics.get("emb_std", 0.0)})
             else:
                 assert isinstance(model, SingleLODJEPA)
                 v_loss, v_metrics = val_step_single_lod(model, v_batch, v_key, alpha=args.alpha, beta=args.beta)
@@ -478,6 +678,9 @@ def train_baseline(args: argparse.Namespace) -> Tuple[Union[SingleLODJEPA, Gener
                 if is_mae:
                     assert isinstance(model, Generative3DMAE)
                     pooled = extract_mae_embeddings(model, v_batch)
+                elif is_u32:
+                    assert isinstance(model, Uniform32JEPA)
+                    pooled = extract_uniform32_embeddings(model, v_batch)
                 else:
                     assert isinstance(model, SingleLODJEPA)
                     pooled = extract_single_lod_embeddings(model, v_batch)

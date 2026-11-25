@@ -558,6 +558,9 @@ def train_ppo(
     rolling_ep_returns: deque = deque(maxlen=20)
     rolling_targets_reached: deque = deque(maxlen=20)
     num_targets_env = int(getattr(env, "num_targets", 1))
+    rolling_target_steps: Dict[int, deque] = {
+        k: deque(maxlen=20) for k in range(1, num_targets_env + 1)
+    }
 
     log_file = os.path.join(save_dir, "train.log")
     pb = ProgressBar(
@@ -623,6 +626,9 @@ def train_ppo(
                 rolling_targets_reached.append(
                     float(info.get("targets_reached", 1 if is_succ else 0))
                 )
+                for t_k, t_step in enumerate(info.get("target_reach_steps", []), start=1):
+                    if t_k in rolling_target_steps:
+                        rolling_target_steps[t_k].append(float(t_step))
                 current_ep_reward = 0.0
                 try:
                     current_obs = env.reset(seed=int(np_rng.integers(0, 1_000_000)))
@@ -736,6 +742,9 @@ def train_ppo(
             "turn_pct": turn_pct,
             "blocked_pct": blocked_pct,
         }
+        for t_k in range(1, num_targets_env + 1):
+            q_k = rolling_target_steps[t_k]
+            record[f"avg_steps_to_target_{t_k}"] = float(np.mean(q_k)) if len(q_k) > 0 else None
         metrics_history.append(record)
 
         # Append to ppo_metrics.jsonl
@@ -766,6 +775,9 @@ def train_ppo(
             "turn_pct": turn_pct,
             "blocked_pct": blocked_pct,
         }
+        for t_k in range(1, num_targets_env + 1):
+            q_k = rolling_target_steps[t_k]
+            record[f"avg_steps_to_target_{t_k}"] = float(np.mean(q_k)) if len(q_k) > 0 else None
 
         curr_stage = int(getattr(getattr(env, "curriculum", None), "stage", 0))
         if num_targets_env == 1 and curr_stage > best_stage:

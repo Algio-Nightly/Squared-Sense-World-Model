@@ -215,5 +215,5 @@ def test_eval_navigation_gating_comparison(tmp_path) -> None:
     mflops_gated = metrics_gated["empirical_mflops_per_step"]
 
     print(f"Dense MFLOPs/step: {mflops_dense:.1f} | Gated MFLOPs/step: {mflops_gated:.1f}")
-    assert mflops_dense == pytest.approx(1743.6, rel=1e-3)
+    assert mflops_dense == pytest.approx(1770.06, rel=1e-3)
     assert mflops_gated < mflops_dense, f"Gated MFLOPs ({mflops_gated}) must be strictly less than dense ({mflops_dense})"

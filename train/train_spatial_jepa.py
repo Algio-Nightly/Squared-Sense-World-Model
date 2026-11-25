@@ -104,6 +104,11 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Weight for VICReg covariance regularizer (default: 0.04).",
     )
     parser.add_argument(
+        "--no_vicreg",
+        action="store_true",
+        help="Disable VICReg variance/covariance regularization (sets alpha=0.0, beta=0.0) for collapse control.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -152,6 +157,9 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     parsed = parser.parse_args(args)
+    if parsed.no_vicreg:
+        parsed.alpha = 0.0
+        parsed.beta = 0.0
     if parsed.smoke_test:
         parsed.epochs = 2
         parsed.batch_size = 4
